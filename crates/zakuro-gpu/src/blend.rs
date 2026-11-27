@@ -26,6 +26,17 @@ impl Equation {
         }
     }
 
+    /// the raw encoding the register carries, for the OpenGL path to translate
+    pub(crate) fn raw(self) -> u32 {
+        match self {
+            Equation::Add => 0,
+            Equation::Subtract => 1,
+            Equation::ReverseSubtract => 2,
+            Equation::Min => 3,
+            Equation::Max => 4,
+        }
+    }
+
     fn apply(self, source: f32, source_factor: f32, dest: f32, dest_factor: f32) -> f32 {
         let s = source * source_factor;
         let d = dest * dest_factor;
@@ -80,6 +91,27 @@ impl Factor {
             14 => Factor::SourceAlphaSaturate,
             // 15 is undocumented, Citra treats it as one
             _ => Factor::One,
+        }
+    }
+
+    /// the raw encoding the register carries, for the OpenGL path to translate
+    pub(crate) fn raw(self) -> u32 {
+        match self {
+            Factor::Zero => 0,
+            Factor::One => 1,
+            Factor::SourceColor => 2,
+            Factor::OneMinusSourceColor => 3,
+            Factor::DestColor => 4,
+            Factor::OneMinusDestColor => 5,
+            Factor::SourceAlpha => 6,
+            Factor::OneMinusSourceAlpha => 7,
+            Factor::DestAlpha => 8,
+            Factor::OneMinusDestAlpha => 9,
+            Factor::ConstantColor => 10,
+            Factor::OneMinusConstantColor => 11,
+            Factor::ConstantAlpha => 12,
+            Factor::OneMinusConstantAlpha => 13,
+            Factor::SourceAlphaSaturate => 14,
         }
     }
 
@@ -172,6 +204,27 @@ impl Blend {
             self.alpha_dest.value(3, source, dest, self.constant),
         );
         out
+    }
+
+    /// the decoded blend as raw register halves, color and alpha, for the OpenGL
+    /// path to mirror: each side's equation and its source and destination factors,
+    /// then the constant the Constant* factors read
+    pub(crate) fn config(&self) -> ([(u32, u32, u32); 2], [f32; 4]) {
+        (
+            [
+                (
+                    self.color_equation.raw(),
+                    self.color_source.raw(),
+                    self.color_dest.raw(),
+                ),
+                (
+                    self.alpha_equation.raw(),
+                    self.alpha_source.raw(),
+                    self.alpha_dest.raw(),
+                ),
+            ],
+            self.constant,
+        )
     }
 }
 

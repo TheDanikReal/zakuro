@@ -3197,27 +3197,36 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         indices.as_chunks::<3>().0.iter().map(|&[a, b, c]| [placed[a as usize], placed[b as usize], placed[c as usize]]).collect();
     #[cfg(feature = "opengl")]
     if let Some(renderer) = resources.opengl.as_mut() {
-        let supported = state.target.buffer_width.is_multiple_of(8)
-            && state.target.buffer_height.is_multiple_of(8)
-            && state.target.format == ColorFormat::Rgba8
-            && state.target.write == [true; 4]
-            && state.textures.iter().all(Option::is_none)
-            && state.proctex.is_none()
-            && state.lighting.is_none()
-            && state.fog.is_none()
-            && state.alpha_test.is_none()
-            && state.blend.is_none()
-            && state.logic_op.is_none()
-            && state.tex_env.is_vertex_color_passthrough()
-            && state.depth_stencil.as_ref().map_or(true, |depth| {
-                let color_end = state.target.addr.saturating_add(state.target.buffer_width.saturating_mul(state.target.buffer_height).saturating_mul(4));
-                let depth_end = depth.addr.saturating_add(state.target.buffer_width.saturating_mul(state.target.buffer_height).saturating_mul(depth.bytes));
-                color_end <= depth.addr || depth_end <= state.target.addr
-            });
-        if supported {
-            match renderer.draw(memory, &state.target, state.depth_stencil.as_ref(), state.depth_map, &triangles) {
-                Ok(()) => return Some(triangle_count as u32),
-                Err(error) => log::error!("the OpenGL rasterizer could not draw, {error}, drawing in software"),
+        // the output merger, what the GL path mirrors w/ its fixed function, or
+        // None for state it cannot take, like a logic op or a blend factor GL lacks
+        let output = opengl::output_state(
+            state.blend.as_ref(),
+            state.logic_op,
+            state
+                .alpha_test
+                .as_ref()
+                .map(|test| (test.function, test.reference)),
+            state.target.write,
+        );
+        if let Some(output) = output {
+            let supported = state.target.buffer_width.is_multiple_of(8)
+                && state.target.buffer_height.is_multiple_of(8)
+                && state.target.format == ColorFormat::Rgba8
+                && state.textures.iter().all(Option::is_none)
+                && state.proctex.is_none()
+                && state.lighting.is_none()
+                && state.fog.is_none()
+                && state.tex_env.is_vertex_color_passthrough()
+                && state.depth_stencil.as_ref().map_or(true, |depth| {
+                    let color_end = state.target.addr.saturating_add(state.target.buffer_width.saturating_mul(state.target.buffer_height).saturating_mul(4));
+                    let depth_end = depth.addr.saturating_add(state.target.buffer_width.saturating_mul(state.target.buffer_height).saturating_mul(depth.bytes));
+                    color_end <= depth.addr || depth_end <= state.target.addr
+                });
+            if supported {
+                match renderer.draw(memory, &state.target, state.depth_stencil.as_ref(), state.depth_map, &output, &triangles) {
+                    Ok(()) => return Some(triangle_count as u32),
+                    Err(error) => log::error!("the OpenGL rasterizer could not draw, {error}, drawing in software"),
+                }
             }
         }
     }

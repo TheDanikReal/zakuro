@@ -1253,6 +1253,445 @@ fn opengl_depth_maps_match_the_cpu() {
 }
 
 // ---------------------------------------------------------------------------
+// the output merger: the alpha test, blending and partial color masks
+// ---------------------------------------------------------------------------
+
+/// the GPUREG_BLEND_FUNC halves packed: each side's equation, then its source and
+/// destination factors, the encoding `Blend::read` takes apart
+fn blend_func(color: (u32, u32, u32), alpha: (u32, u32, u32)) -> u32 {
+    color.0 | (alpha.0 << 8) | (color.1 << 16) | (color.2 << 20) | (alpha.1 << 24)
+        | (alpha.2 << 28)
+}
+
+/// the register the blend constant sits in, and a constant unlike the quads'
+/// colors, so the Constant* factors show their own bytes, packed red low
+const REG_BLEND_COLOR: usize = 0x0103;
+const BLEND_CONSTANT: u32 = 0xFF80_40C0;
+
+/// every compare function takes and leaves the same fragments when the alpha
+/// under test is flat and sits clear of the reference: FLAT's alpha quantizes to
+/// 127 on both sides, so each function gets one reference it must pass and one
+/// it must refuse, byte for byte
+#[test]
+fn opengl_alpha_test_agrees_on_flat_alphas() {
+    let cases: [(&str, u32, u32, bool); 14] = [
+        ("never", 0, 0, false),
+        ("always", 1, 0, true),
+        ("equal passing", 2, 127, true),
+        ("equal refusing", 2, 126, false),
+        ("not equal passing", 3, 126, true),
+        ("not equal refusing", 3, 127, false),
+        ("less passing", 4, 200, true),
+        ("less refusing", 4, 127, false),
+        ("less or equal passing", 5, 127, true),
+        ("less or equal refusing", 5, 126, false),
+        ("greater passing", 6, 126, true),
+        ("greater refusing", 6, 127, false),
+        ("greater or equal passing", 7, 127, true),
+        ("greater or equal refusing", 7, 200, false),
+    ];
+    for (name, function, reference, passes) in cases {
+        let Some((cpu, gl, start)) = (|| {
+            let mut resources = opengl_resources()?;
+            let mut registers = registers(0);
+            registers[REG_ALPHA_TEST] = 1 | (function << 4) | (reference << 8);
+            let triangle = cover((0.0, 0.0, 16.0, 16.0), -0.5, FLAT);
+            let mut cpu = CountingMemory::zeroed(0x1_0000);
+            let mut gl = CountingMemory::zeroed(0x1_0000);
+            let start = cpu.clone();
+            rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &triangle);
+            rasterize_shaded(&registers, &mut gl, &mut resources, &triangle);
+            resolve(&mut resources, &mut gl, 0);
+            Some((cpu, gl, start))
+        })() else {
+            return;
+        };
+        let what = format!("the alpha test {name} (function {function}, reference {reference})");
+        assert_coverage_agrees(&cpu, &gl, &start, &what);
+        assert_images_identical(&cpu, &gl, &what);
+        // the state alone dictates whether anything survives, whichever backend drew it
+        let drew_any = coverage(&cpu, &start).iter().any(|&covered| covered);
+        assert_eq!(
+            drew_any, passes,
+            "{what}: the backends drew {drew_any} where the reference says {passes}",
+        );
+    }
+}
+
+/// the alpha test over a triangle whose alpha slides across the reference: the
+/// backends may only disagree where the fragment's alpha sits on the reference
+/// itself, the one byte a step of float noise flips, and pixels both drew agree
+/// within that noise
+#[test]
+fn opengl_alpha_test_takes_the_same_fragments_of_a_varying_alpha() {
+    let Some(mut resources) = opengl_resources() else {
+        return;
+    };
+    let mut registers = registers(0);
+    // on, Less, against 128: fragments below 128 continue, the rest go
+    registers[REG_ALPHA_TEST] = 1 | (4 << 4) | (128 << 8);
+    let triangle = slanted(
+        [
+            [0.5, 0.5, 0.5, 0.05],
+            [0.5, 0.5, 0.5, 0.55],
+            [0.5, 0.5, 0.5, 0.95],
+        ],
+        [1.0, 1.0, 1.0],
+        -0.5,
+    );
+    let mut cpu = CountingMemory::zeroed(0x1_0000);
+    let mut gl = CountingMemory::zeroed(0x1_0000);
+    rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &triangle);
+    rasterize_shaded(&registers, &mut gl, &mut resources, &triangle);
+    resolve(&mut resources, &mut gl, 0);
+    let (cpu_pixels, gl_pixels) = (image(&cpu), image(&gl));
+    // the memories keep the bytes in the buffer's ABGR order, so the alpha is
+    // byte zero, and zero bytes mean the pixel drew nothing
+    let alpha_of = |pixel: [u8; 4]| pixel[0];
+    let mut disagreements: Vec<(u32, u32, [u8; 4], [u8; 4])> = Vec::new();
+    for index in 0..(BUFFER * BUFFER) as usize {
+        let (drawn_cpu, drawn_gl) = (cpu_pixels[index], gl_pixels[index]);
+        let (cpu_drew, gl_drew) = (drawn_cpu != [0; 4], drawn_gl != [0; 4]);
+        if drawn_cpu == drawn_gl || (cpu_drew && gl_drew) {
+            // both drew or neither did; the both-drew noise is checked below
+            continue;
+        }
+        // a pixel only one backend drew has to hold the reference in its alpha,
+        // the rounding boundary where the two interpolations may land apart.
+        // the quad's other bytes sit far from zero, so zero means not drawn
+        let drawn = if cpu_drew { drawn_cpu } else { drawn_gl };
+        if alpha_of(drawn).abs_diff(128) > 1 {
+            disagreements.push((
+                index as u32 % BUFFER,
+                index as u32 / BUFFER,
+                drawn_cpu,
+                drawn_gl,
+            ));
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "the alpha test split the triangle where the state does not: {disagreements:?}",
+    );
+    // pixels both drew agree on the alpha the test judged within a noise step,
+    // the RGB within two, the interpolation's usual slack
+    for index in 0..(BUFFER * BUFFER) as usize {
+        if cpu_pixels[index] == [0; 4] || gl_pixels[index] == [0; 4] {
+            continue;
+        }
+        let (cpu_pixel, gl_pixel) = (cpu_pixels[index], gl_pixels[index]);
+        let off = cpu_pixel
+            .iter()
+            .zip(gl_pixel.iter())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            off <= 2 && alpha_of(cpu_pixel).abs_diff(alpha_of(gl_pixel)) <= 1,
+            "both backends drew ({}, {}) but left {:?} against {:?}",
+            index as u32 % BUFFER,
+            index as u32 / BUFFER,
+            cpu_pixel,
+            gl_pixel,
+        );
+    }
+}
+
+/// the blend equations and factors, over a base quad each blends into: the GL
+/// blends from the same bytes thru its fixed function, and the two answers sit
+/// a rounding step apart at most, plus the edge pixels' usual slack
+#[test]
+fn opengl_blends_like_the_cpu() {
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    let cases: [(&str, u32); 9] = [
+        // the transparency almost every UI draw sets up
+        ("standard transparency", blend_func((0, 6, 7), (0, 1, 0))),
+        ("additive", blend_func((0, 1, 1), (0, 1, 1))),
+        ("subtractive", blend_func((1, 6, 1), (0, 1, 0))),
+        ("reverse subtract", blend_func((2, 1, 1), (0, 1, 1))),
+        // min and max read the factors, which sit at zero to say so
+        ("minimum", blend_func((3, 0, 0), (3, 0, 0))),
+        ("maximum", blend_func((4, 0, 0), (4, 0, 0))),
+        ("constant factors", blend_func((0, 10, 11), (0, 12, 13))),
+        // GL takes the saturate factor as a color side's source
+        ("source alpha saturate", blend_func((0, 14, 1), (0, 1, 0))),
+        // a different equation on the alpha, subtracting it while the color adds
+        ("a separate alpha equation", blend_func((0, 6, 7), (1, 1, 6))),
+    ];
+    for (name, function) in cases {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut plain = registers(0);
+        plain[REG_BLEND_COLOR] = BLEND_CONSTANT;
+        let mut blended = plain.clone();
+        blended[REG_COLOR_OPERATION] = 0x100;
+        blended[REG_BLEND_FUNC] = function;
+        let base = cover(viewport, -0.5, FLAT);
+        let quad = slanted([OTHER, OTHER, OTHER], [1.2, 0.8, 1.0], -0.4);
+        let placed = placed_triangles(&blended, &quad);
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        // the base quad goes in plain, so the blend works over colors of its own choosing
+        rasterize_shaded(&plain, &mut cpu, &mut Resources::default(), &base);
+        rasterize_shaded(&plain, &mut gl, &mut Resources::default(), &base);
+        rasterize_shaded(&blended, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&blended, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_close(&cpu, &gl, &placed, 1, &format!("the {name} blend"));
+    }
+}
+
+/// the blended alpha channel too: a base quad's alpha and the blend's answer are
+/// the same bytes on both sides, including where the alpha equation is its own
+#[test]
+fn opengl_blended_alphas_come_out_the_same() {
+    for (name, function) in [
+        ("standard transparency", blend_func((0, 6, 7), (0, 1, 0))),
+        ("an alpha of its own", blend_func((0, 6, 7), (0, 1, 6))),
+        ("an additive alpha", blend_func((0, 6, 7), (0, 1, 1))),
+    ] {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut plain = registers(0);
+        plain[REG_BLEND_COLOR] = BLEND_CONSTANT;
+        let mut blended = plain.clone();
+        blended[REG_COLOR_OPERATION] = 0x100;
+        blended[REG_BLEND_FUNC] = function;
+        let base = cover((0.0, 0.0, 16.0, 16.0), -0.5, FLAT);
+        let quad = slanted([OTHER, OTHER, OTHER], [1.0, 1.0, 1.0], -0.4);
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        rasterize_shaded(&plain, &mut cpu, &mut Resources::default(), &base);
+        rasterize_shaded(&plain, &mut gl, &mut Resources::default(), &base);
+        rasterize_shaded(&blended, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&blended, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        let (cpu_pixels, gl_pixels) = (image(&cpu), image(&gl));
+        let mut worst = 0u8;
+        let mut worst_at = 0usize;
+        for index in 0..(BUFFER * BUFFER) as usize {
+            let off = cpu_pixels[index][3].abs_diff(gl_pixels[index][3]);
+            if off > worst {
+                worst = off;
+                worst_at = index;
+            }
+        }
+        assert!(
+            worst <= 1,
+            "the {name} blend left alphas {} apart at ({}, {}) ({} against {})",
+            worst,
+            worst_at as u32 % BUFFER,
+            worst_at as u32 / BUFFER,
+            cpu_pixels[worst_at][3],
+            gl_pixels[worst_at][3],
+        );
+    }
+}
+
+/// partial color masks change only the channels they leave on, byte for byte,
+/// the masked ones holding what the base quad put there
+#[test]
+fn opengl_partial_color_masks_keep_the_masked_channels() {
+    let masks: [(&str, u32, [bool; 4]); 6] = [
+        ("alpha off", 0xF << 8 & !(1 << 11), [true, true, true, false]),
+        ("green off", 0xF << 8 & !(1 << 9), [true, false, true, true]),
+        (
+            "red and blue off",
+            0xF << 8 & !(1 << 8 | 1 << 10),
+            [false, true, false, true],
+        ),
+        ("blue only", 0xF << 8 & (1 << 10), [false, false, true, false]),
+        (
+            "green and alpha only",
+            0xF << 8 & (1 << 9 | 1 << 11),
+            [false, true, false, true],
+        ),
+        ("nothing writable", 0, [false, false, false, false]),
+    ];
+    for (name, mask, writable) in masks {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let plain = registers(0);
+        let mut masked = plain.clone();
+        masked[REG_DEPTH_COLOR_MASK] = mask;
+        let base = cover((0.0, 0.0, 16.0, 16.0), -0.5, FLAT);
+        let quad = slanted([OTHER, OTHER, OTHER], [1.0, 1.1, 0.9], -0.4);
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        rasterize_shaded(&plain, &mut cpu, &mut Resources::default(), &base);
+        rasterize_shaded(&plain, &mut gl, &mut Resources::default(), &base);
+        let underneath = gl.clone();
+        rasterize_shaded(&masked, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&masked, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        let what = format!("the {name} mask");
+        assert_images_identical(&cpu, &gl, &what);
+        // and the masked channels hold what was under the draw, on both sides.
+        // the images keep the bytes in the buffer's ABGR order, red last, so the
+        // writable mask flips over before it can pick bytes
+        let writable_bytes = [writable[3], writable[2], writable[1], writable[0]];
+        let under_pixels = image(&underneath);
+        for (label, memory) in [("the CPU", &cpu), ("the GL", &gl)] {
+            for (index, pixel) in image(memory).iter().enumerate() {
+                for (channel, &writable) in writable_bytes.iter().enumerate() {
+                    assert!(
+                        writable || pixel[channel] == under_pixels[index][channel],
+                        "{what}: {label} changed channel {channel} at ({}, {})",
+                        index as u32 % BUFFER,
+                        index as u32 / BUFFER,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// a draw with the whole output merger on — blending, an alpha test, a partial
+/// color mask, over a depth test and a stencil that writes — rides in behind a
+/// plain base quad, and the quad's alpha fails the test: nothing it does may
+/// touch either buffer, on either backend
+#[test]
+fn opengl_output_merger_states_work_together() {
+    let Some(mut resources) = opengl_resources() else {
+        return;
+    };
+    let mut plain = registers(3);
+    // the base quad's depth clears the Greater test and writes, and no stencil is
+    // on yet, so the byte it leaves alone is the one the prefill put there
+    plain[REG_DEPTH_COLOR_MASK] = 0xF << 8 | 1 | (6 << 4) | 1 << 12;
+    let mut full = plain.clone();
+    // the quad blends w/ standard transparency over the constant
+    full[REG_COLOR_OPERATION] = 0x100;
+    full[REG_BLEND_FUNC] = blend_func((0, 6, 7), (0, 1, 0));
+    full[REG_BLEND_COLOR] = BLEND_CONSTANT;
+    // the alpha test holds FLAT's alpha (127) back: every fragment of the quad goes
+    full[REG_ALPHA_TEST] = 1 | (4 << 4) | (100 << 8);
+    // the stencil would take the replace where fragments survive, and the color
+    // mask sits over blue, though nothing should reach either
+    full[REG_DEPTH_COLOR_MASK] = 0xF << 8 & !(1 << 10) | 1 | (6 << 4) | 1 << 12;
+    full[REG_STENCIL_TEST] = 1
+        | ((Compare::Always as u32 & 0x7) << 4)
+        | (0xFF << 8)
+        | (0x5A << 16)
+        | (0xFF << 24);
+    full[REG_STENCIL_OP] = 2 | (2 << 4) | (2 << 8);
+    let base = cover((0.0, 0.0, 16.0, 16.0), -0.75, FLAT);
+    let quad = slanted([FLAT, FLAT, FLAT], [1.0, 0.9, 1.1], -0.85);
+    let depth_bytes = 4u32;
+    let mut cpu = CountingMemory::prefilled(depth_bytes, |_| (0x33 << 24) | STORED_D24);
+    let mut gl = cpu.clone();
+    rasterize_shaded(&plain, &mut cpu, &mut Resources::default(), &base);
+    rasterize_shaded(&plain, &mut gl, &mut resources, &base);
+    // a reader pulls the base's frame out of the GL before the next draw goes in
+    resolve(&mut resources, &mut gl, depth_bytes);
+    let after_base = (cpu.clone(), gl.clone());
+    rasterize_shaded(&full, &mut cpu, &mut Resources::default(), &quad);
+    rasterize_shaded(&full, &mut gl, &mut resources, &quad);
+    resolve(&mut resources, &mut gl, depth_bytes);
+    let what = "the refused output merger draw";
+    // neither backend moved a byte: the alpha test came before everything else
+    assert_images_identical(&cpu, &after_base.0, &format!("{what}, the CPU stood still"));
+    assert_images_identical(&gl, &after_base.1, &format!("{what}, the GL stood still"));
+    assert_images_identical(&cpu, &gl, what);
+    for (label, memory) in [("the CPU", &cpu), ("the GL", &gl)] {
+        for (sample, &word) in depth_image(memory, 4).iter().enumerate() {
+            assert_eq!(
+                (word >> 24) as u8,
+                0x33,
+                "{what}: {} left the stencil at ({}, {}) off the prefill, where only the alpha test was asked",
+                label,
+                sample as u32 % BUFFER,
+                sample as u32 / BUFFER,
+            );
+        }
+    }
+}
+
+/// the same output merger draw, but the quad's alpha passes, so the blend, the
+/// mask, the stencil and the depth write all land where the quad covers: the
+/// backends agree pixel for pixel and on the stencil byte's spread
+#[test]
+fn opengl_output_merger_states_work_together_when_the_alpha_passes() {
+    let Some(mut resources) = opengl_resources() else {
+        return;
+    };
+    let mut plain = registers(3);
+    // the base quad's depth clears the Greater test and writes, no stencil yet
+    plain[REG_DEPTH_COLOR_MASK] = 0xF << 8 | 1 | (6 << 4) | 1 << 12;
+    let mut full = plain.clone();
+    // source alpha over one minus source alpha
+    full[REG_COLOR_OPERATION] = 0x100;
+    full[REG_BLEND_FUNC] = blend_func((0, 6, 7), (0, 1, 0));
+    full[REG_BLEND_COLOR] = BLEND_CONSTANT;
+    // the alpha test lets an alpha of 229 past the Greater against 150
+    full[REG_ALPHA_TEST] = 1 | (6 << 4) | (150 << 8);
+    // green stays as the blend leaves the rest of it, and the stencil takes the
+    // replace where the quad's fragments survive
+    full[REG_DEPTH_COLOR_MASK] = 0xF << 8 & !(1 << 9) | 1 | (6 << 4) | 1 << 12;
+    full[REG_STENCIL_TEST] = 1
+        | ((Compare::Always as u32 & 0x7) << 4)
+        | (0xFF << 8)
+        | (0x5A << 16)
+        | (0xFF << 24);
+    full[REG_STENCIL_OP] = 2 | (2 << 4) | (2 << 8);
+    let base = cover((0.0, 0.0, 16.0, 16.0), -0.75, FLAT);
+    let quad = slanted(
+        [
+            [0.7, 0.3, 0.9, 0.9],
+            [0.4, 0.8, 0.2, 0.9],
+            [0.9, 0.5, 0.6, 0.9],
+        ],
+        [1.0, 1.0, 1.0],
+        -0.85,
+    );
+    let placed = placed_triangles(&full, &quad);
+    let depth_bytes = 4u32;
+    let mut cpu = CountingMemory::prefilled(depth_bytes, |_| (0x33 << 24) | STORED_D24);
+    let mut gl = cpu.clone();
+    rasterize_shaded(&plain, &mut cpu, &mut Resources::default(), &base);
+    rasterize_shaded(&plain, &mut gl, &mut resources, &base);
+    // the base's frame is read back before the quad's draw goes in
+    resolve(&mut resources, &mut gl, depth_bytes);
+    let after_base = gl.clone();
+    rasterize_shaded(&full, &mut cpu, &mut Resources::default(), &quad);
+    rasterize_shaded(&full, &mut gl, &mut resources, &quad);
+    resolve(&mut resources, &mut gl, depth_bytes);
+    let what = "the passing output merger draw";
+    let covered = coverage(&cpu, &after_base);
+    assert!(covered.iter().any(|&covered| covered), "{what}: nothing drew");
+    assert_coverage_agrees(&cpu, &gl, &after_base, what);
+    assert_images_close(&cpu, &gl, &placed, 1, what);
+    // where the quad drew, the depth moved a rounding step apart at most, and the
+    // stencil took the replace there while keeping the base's byte elsewhere
+    assert_depth_close(&cpu, &gl, depth_bytes, &covered, 2, what);
+    // the depth buffer sits tiled in memory, so the stencil byte of the pixel at
+    // (x, y) lives at its morton spot, not at the sample's linear offset
+    let stencil_at = |memory: &CountingMemory, x: u32, y: u32| -> u8 {
+        let at = (DEPTH + morton_offset(x, BUFFER - 1 - y, BUFFER, 4)) as usize;
+        (u32::from_le_bytes(memory.flat[at..at + 4].try_into().expect("D24S8 word")) >> 24) as u8
+    };
+    for (label, memory) in [("the CPU", &cpu), ("the GL", &gl)] {
+        for y in 0..BUFFER {
+            for x in 0..BUFFER {
+                let expected = if covered[(y * BUFFER + x) as usize] {
+                    0x5A
+                } else {
+                    0x33
+                };
+                assert_eq!(
+                    stencil_at(memory, x, y),
+                    expected,
+                    "{what}: {label} left the stencil at ({x}, {y}) off the state's answer",
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // the lazy FBO cache: uploads, readbacks and guards
 // ---------------------------------------------------------------------------
 
@@ -1404,26 +1843,18 @@ fn opengl_sync_resolves_and_invalidates() {
     );
 }
 
-/// a draw the OpenGL path cannot take — blending, logic ops, alpha test, a bound
-/// texture, a non-RGBA8 target, partial color masks — falls back to the CPU
-/// rasterizer after syncing what the GL drew, and the bytes match a run that
-/// never saw the GL at all
+/// a draw the OpenGL path cannot take — a logic op, a bound texture, a non-RGBA8
+/// target, a blend factor GL lacks — falls back to the CPU rasterizer after
+/// syncing what the GL drew, and the bytes match a run that never saw the GL at all
 #[test]
 fn opengl_unsupported_draws_fall_back_after_syncing_and_match_the_cpu() {
     // (an unaligned target would join these, but the CPU rasterizer itself panics
     // on tile-unaligned widths today, see the ignored regression test and TODO.md)
     type StateChange = fn(&mut Vec<u32>);
-    let cases: [(&str, StateChange); 6] = [
-        ("blending", |registers| {
-            registers[REG_COLOR_OPERATION] = 0x100;
-            registers[REG_BLEND_FUNC] = 0x0104_0104; // src alpha over one minus src alpha
-        }),
+    let cases: [(&str, StateChange); 4] = [
         ("a logic op", |registers| {
             registers[REG_COLOR_OPERATION] = 0;
             registers[REG_LOGIC_OP] = 6; // XOR, not the copy that reads as none
-        }),
-        ("an alpha test", |registers| {
-            registers[REG_ALPHA_TEST] = 1 | (4 << 4); // on, Less, reference 0
         }),
         ("a texture", |registers| {
             // unit 0 on, an 8x8 RGBA8 texture sitting inside the target's own bytes
@@ -1435,8 +1866,11 @@ fn opengl_unsupported_draws_fall_back_after_syncing_and_match_the_cpu() {
         ("an RGB8 target", |registers| {
             registers[REG_COLOR_BUFFER_FORMAT] = 1 << 16;
         }),
-        ("a partial color mask", |registers| {
-            registers[REG_DEPTH_COLOR_MASK] = (0xF << 8 | 1 << 12) & !(1 << 9 | 1 << 11);
+        ("a blend factor GL lacks", |registers| {
+            // GL takes the source alpha saturate factor as the color side's
+            // source alone, a draw using it as a destination stays on the CPU
+            registers[REG_COLOR_OPERATION] = 0x100;
+            registers[REG_BLEND_FUNC] = 0x11E1_0000; // color side: add, one, the saturate factor as the destination
         }),
     ];
     for (name, apply) in cases {
@@ -1542,6 +1976,7 @@ fn opengl_overlapping_surfaces_resolve_each_other() {
     };
     let mut gl = CountingMemory::zeroed(0x1_0000);
     let mut cpu = CountingMemory::zeroed(0x1_0000);
+    let output = opengl::OutputState::default();
     {
         let renderer = resources.opengl.as_mut().unwrap();
         // A: color at 0x1000 and D16 depth at 0x3000
@@ -1551,6 +1986,7 @@ fn opengl_overlapping_surfaces_resolve_each_other() {
                 &target(0x1000),
                 Some(&depth(0x3000)),
                 map,
+                &output,
                 &[screen_triangle],
             )
             .expect("the first draw");
@@ -1561,6 +1997,7 @@ fn opengl_overlapping_surfaces_resolve_each_other() {
                 &target(0x1100),
                 Some(&depth(0x3100)),
                 map,
+                &output,
                 &[screen_triangle],
             )
             .expect("the second draw");
@@ -1883,26 +2320,63 @@ fn opengl_sync_memory_and_sync_depth_hooks_write_back() {
     }
 }
 
-/// the GL path could keep partial color masks itself once it tracks per-channel
-/// writes; today they fall back to the CPU (covered by the fallback test), and
-/// this is where the acceleration differential goes when they land
+/// a surface the cache gives up under its budget is resolved into guest memory at
+/// the eviction, and a later draw to it uploads that resolved state again rather
+/// than pretending it was resident the whole time. The real budget needs
+/// thousands of targets to turn over, so the test turns it down to a few.
 #[test]
-#[ignore = "the OpenGL path still falls back on partial color masks (see TODO.md)"]
-fn opengl_partial_color_masks_accelerate_once_supported() {
+fn opengl_evicted_surfaces_resolve_into_guest_memory() {
     let Some(mut resources) = opengl_resources() else {
         return;
     };
-    let mut registers = registers(0);
-    registers[REG_DEPTH_COLOR_MASK] = 0xF << 8 & !(1 << 9); // green off
-    let mut gl = CountingMemory::zeroed(0x1_0000);
+    resources
+        .opengl
+        .as_mut()
+        .unwrap()
+        .limit_surface_cache(2_500); // two 16x16 targets w/ no depth fit, not three
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    let targets = [(0x1000u32, FLAT), (0x4000, OTHER), (0x8000, FLAT)];
+    let quads: Vec<Vec<Vertex>> = targets
+        .iter()
+        .map(|(_, color)| cover(viewport, -0.5, *color))
+        .collect();
     let mut cpu = CountingMemory::zeroed(0x1_0000);
-    let triangle = cover((0.0, 0.0, 16.0, 16.0), -0.5, FLAT);
-    rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &triangle);
-    rasterize_shaded(&registers, &mut gl, &mut resources, &triangle);
-    assert_images_identical(&cpu, &gl, "a partial color mask draw");
+    let mut gl = CountingMemory::zeroed(0x1_0000);
+    // three distinct targets: the third evicts the first, writing its pixels back
+    for ((addr, _), quad) in targets.iter().zip(quads.iter()) {
+        let mut registers = registers(0);
+        registers[REG_COLOR_BUFFER_ADDRESS] = addr >> 3;
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, quad);
+    }
     assert_eq!(
-        gl.writes_over(COLOR, COLOR_BYTES),
-        0,
-        "the draw should run accelerated, nothing read back",
+        gl.writes_over(0x1000, COLOR_BYTES),
+        1,
+        "the first target should have been resolved into memory once, at the eviction",
     );
+    assert_eq!(
+        gl.region(0x1000, COLOR_BYTES),
+        cpu.region(0x1000, COLOR_BYTES),
+        "the eviction left the first target's guest bytes different from the CPU's",
+    );
+    // and the second still holds what it drew, with no readback asked of it yet
+    assert_eq!(
+        gl.writes_over(0x4000, COLOR_BYTES),
+        0,
+        "the second target should still be resident",
+    );
+    // drawing to the first again uploads what the eviction wrote back
+    let before = gl.reads_over(0x1000, COLOR_BYTES);
+    let second_visit = slanted([FLAT, FLAT, FLAT], [1.0, 1.2, 0.8], -0.4);
+    let mut registers = registers(0);
+    registers[REG_COLOR_BUFFER_ADDRESS] = 0x1000 >> 3;
+    let placed = placed_triangles(&registers, &second_visit);
+    rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &second_visit);
+    rasterize_shaded(&registers, &mut gl, &mut resources, &second_visit);
+    assert!(
+        gl.reads_over(0x1000, COLOR_BYTES) > before,
+        "the second visit should have uploaded the target it was evicted from",
+    );
+    resolve(&mut resources, &mut gl, 0);
+    assert_images_close(&cpu, &gl, &placed, 1, "the target after its eviction and return");
 }

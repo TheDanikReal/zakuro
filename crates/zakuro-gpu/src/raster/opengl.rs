@@ -29,16 +29,156 @@ in vec4 vertex_color;
 uniform float depth_scale;
 uniform float depth_offset;
 uniform bool w_buffer;
+uniform bool alpha_test;
+uniform int alpha_function;
+uniform int alpha_reference;
 out vec4 color;
+bool alpha_passes(int value, int reference) {
+    if (alpha_function == 0) return false;
+    if (alpha_function == 1) return true;
+    if (alpha_function == 2) return value == reference;
+    if (alpha_function == 3) return value != reference;
+    if (alpha_function == 4) return value < reference;
+    if (alpha_function == 5) return value <= reference;
+    if (alpha_function == 6) return value > reference;
+    return value >= reference;
+}
 void main() {
     float depth = pica_depth * depth_scale + depth_offset;
     if (w_buffer) depth /= max(pica_inverse_w, 1e-20);
     gl_FragDepth = clamp(depth, 0.0, 1.0);
-    color = floor(clamp(vertex_color, 0.0, 1.0) * 255.0) / 255.0;
+    // the color leaves as whole bytes, like the software path truncates, so the
+    // alpha test judges the same byte a fallback draw would
+    vec4 quantized = floor(clamp(vertex_color, 0.0, 1.0) * 255.0);
+    if (alpha_test && !alpha_passes(int(quantized.a), alpha_reference)) discard;
+    color = quantized / 255.0;
 }
 "#;
 
 const SURFACE_CACHE_BUDGET: u64 = 128 * 1024 * 1024;
+
+/// what happens to a fragment once the shader is done w/ it: the alpha test, how
+/// it merges w/ the buffer and the channels the draw may change. The GL path
+/// mirrors the parts of this its own fixed function can express, and a draw
+/// whose state it cannot stays on the CPU rasterizer.
+pub(crate) struct OutputState {
+    /// the alpha test's function and reference, when the test is on, both as the
+    /// fragment shader numbers them
+    alpha_test: Option<(u32, u32)>,
+    /// the blend, when the output merger blends instead of copying
+    blend: Option<BlendSetup>,
+    /// red, green, blue and alpha writes, one channel each
+    write: [bool; 4],
+}
+
+impl Default for OutputState {
+    /// the plain copy the output merger makes when nothing is set, every channel
+    /// the draw may change
+    fn default() -> Self {
+        OutputState {
+            alpha_test: None,
+            blend: None,
+            write: [true; 4],
+        }
+    }
+}
+
+/// the blend as GL takes it: the color and alpha sides each carrying an equation
+/// and its source and destination factors, over the constant the constant factors read
+struct BlendSetup {
+    equations: [u32; 2],
+    functions: [(u32, u32); 2],
+    constant: [f32; 4],
+}
+
+/// the output state the OpenGL path can take, or None when it cannot mirror what
+/// the registers describe and the draw belongs to the CPU rasterizer
+pub(crate) fn output_state(
+    blend: Option<&crate::blend::Blend>,
+    logic_op: Option<crate::blend::LogicOp>,
+    alpha_test: Option<(super::Compare, u8)>,
+    write: [bool; 4],
+) -> Option<OutputState> {
+    // a logic op works bits in the buffer, which GL does thru glLogicOp and the
+    // GL binding does not wrap, so those draws stay on the CPU for now
+    if logic_op.is_some() {
+        return None;
+    }
+    let blend = match blend {
+        None => None,
+        Some(blend) => {
+            let ([color, alpha], constant) = blend.config();
+            // GL takes the saturate factor as the color side's source alone; a
+            // draw putting it anywhere else stays on the CPU
+            if color.2 == 14 || alpha.1 == 14 || alpha.2 == 14 {
+                return None;
+            }
+            Some(BlendSetup {
+                equations: [blend_equation(color.0), blend_equation(alpha.0)],
+                functions: [
+                    (blend_factor(color.1), blend_factor(color.2)),
+                    (blend_factor(alpha.1), blend_factor(alpha.2)),
+                ],
+                constant,
+            })
+        }
+    };
+    Some(OutputState {
+        alpha_test: alpha_test
+            .map(|(function, reference)| (alpha_function(function), u32::from(reference))),
+        blend,
+        write,
+    })
+}
+
+/// the PICA's equation numbering onto GL's, which shares the order but not the values
+fn blend_equation(raw: u32) -> u32 {
+    match raw {
+        1 => glow::FUNC_SUBTRACT,
+        2 => glow::FUNC_REVERSE_SUBTRACT,
+        3 => glow::MIN,
+        4 => glow::MAX,
+        // 0, plus the undocumented 5 to 7, hardware treats those as add
+        _ => glow::FUNC_ADD,
+    }
+}
+
+/// the PICA's factor numbering onto GL's blend factors
+fn blend_factor(raw: u32) -> u32 {
+    match raw {
+        0 => glow::ZERO,
+        1 => glow::ONE,
+        2 => glow::SRC_COLOR,
+        3 => glow::ONE_MINUS_SRC_COLOR,
+        4 => glow::DST_COLOR,
+        5 => glow::ONE_MINUS_DST_COLOR,
+        6 => glow::SRC_ALPHA,
+        7 => glow::ONE_MINUS_SRC_ALPHA,
+        8 => glow::DST_ALPHA,
+        9 => glow::ONE_MINUS_DST_ALPHA,
+        10 => glow::CONSTANT_COLOR,
+        11 => glow::ONE_MINUS_CONSTANT_COLOR,
+        12 => glow::CONSTANT_ALPHA,
+        13 => glow::ONE_MINUS_CONSTANT_ALPHA,
+        // 14, the saturate factor, GL takes as the color side's source only,
+        // which output_state checks for
+        _ => glow::SRC_ALPHA_SATURATE,
+    }
+}
+
+/// the compare function as the fragment shader numbers it, the PICA's own encoding
+fn alpha_function(value: super::Compare) -> u32 {
+    match value {
+        super::Compare::Never => 0,
+        super::Compare::Always => 1,
+        super::Compare::Equal => 2,
+        super::Compare::NotEqual => 3,
+        super::Compare::Less => 4,
+        super::Compare::LessOrEqual => 5,
+        super::Compare::Greater => 6,
+        super::Compare::GreaterOrEqual => 7,
+    }
+}
 
 /// OpenGL resources are created and used on the thread where the context is current.
 pub(crate) struct OpenGlRasterizer {
@@ -49,6 +189,9 @@ pub(crate) struct OpenGlRasterizer {
     surfaces: HashMap<SurfaceKey, Surface>,
     surface_bytes: u64,
     surface_clock: u64,
+    /// what evict_to_budget keeps the cache under, the real budget but for the
+    /// tests, which cannot draw the thousands of targets 128 MiB needs to turn over
+    surface_budget: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -142,6 +285,7 @@ impl OpenGlRasterizer {
                 surfaces: HashMap::new(),
                 surface_bytes: 0,
                 surface_clock: 0,
+                surface_budget: SURFACE_CACHE_BUDGET,
             })
         }
     }
@@ -152,6 +296,7 @@ impl OpenGlRasterizer {
         target: &ColorTarget,
         depth: Option<&DepthStencil>,
         depth_map: DepthMap,
+        output: &OutputState,
         triangles: &[[Screen; 3]],
     ) -> Result<(), String> {
         if triangles.is_empty() || target.right <= target.left || target.top <= target.bottom {
@@ -351,7 +496,33 @@ impl OpenGlRasterizer {
                 gl.disable(glow::CULL_FACE);
                 gl.disable(glow::DITHER);
                 gl.disable(glow::FRAMEBUFFER_SRGB);
-                gl.color_mask(true, true, true, true);
+                gl.color_mask(
+                    output.write[0],
+                    output.write[1],
+                    output.write[2],
+                    output.write[3],
+                );
+                match &output.blend {
+                    Some(blend) => {
+                        gl.enable(glow::BLEND);
+                        gl.blend_color(
+                            blend.constant[0],
+                            blend.constant[1],
+                            blend.constant[2],
+                            blend.constant[3],
+                        );
+                        gl.blend_equation_separate(blend.equations[0], blend.equations[1]);
+                        gl.blend_func_separate(
+                            blend.functions[0].0,
+                            blend.functions[0].1,
+                            blend.functions[1].0,
+                            blend.functions[1].1,
+                        );
+                    }
+                    None => {
+                        gl.disable(glow::BLEND);
+                    }
+                }
                 gl.use_program(Some(self.program));
                 gl.bind_vertex_array(Some(self.vertex_array));
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vertices));
@@ -364,6 +535,21 @@ impl OpenGlRasterizer {
                 }
                 if let Some(location) = gl.get_uniform_location(self.program, "w_buffer") {
                     gl.uniform_1_i32(Some(&location), depth_map.w_buffer as i32);
+                }
+                if let Some(location) = gl.get_uniform_location(self.program, "alpha_test") {
+                    gl.uniform_1_i32(Some(&location), output.alpha_test.is_some() as i32);
+                }
+                if let Some(location) = gl.get_uniform_location(self.program, "alpha_function") {
+                    gl.uniform_1_i32(
+                        Some(&location),
+                        output.alpha_test.map_or(1, |(function, _)| function as i32),
+                    );
+                }
+                if let Some(location) = gl.get_uniform_location(self.program, "alpha_reference") {
+                    gl.uniform_1_i32(
+                        Some(&location),
+                        output.alpha_test.map_or(0, |(_, reference)| reference as i32),
+                    );
                 }
                 gl.draw_arrays(glow::TRIANGLES, 0, (vertices.len() / 8) as i32);
                 gl.bind_vertex_array(None);
@@ -407,8 +593,15 @@ impl OpenGlRasterizer {
         self.surface_bytes = 0;
     }
 
+    /// a smaller cache for the tests, which cannot draw the thousands of
+    /// distinct targets the real budget needs to turn the cache over
+    #[cfg(test)]
+    pub(crate) fn limit_surface_cache(&mut self, bytes: u64) {
+        self.surface_budget = bytes;
+    }
+
     fn evict_to_budget<M: GpuMemory>(&mut self, memory: &mut M, incoming_bytes: u64) {
-        let limit = SURFACE_CACHE_BUDGET.saturating_sub(incoming_bytes);
+        let limit = self.surface_budget.saturating_sub(incoming_bytes);
         while self.surface_bytes > limit {
             let Some(key) = self
                 .surfaces

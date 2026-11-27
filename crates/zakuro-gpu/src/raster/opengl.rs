@@ -7,11 +7,13 @@ use std::collections::HashMap;
 use super::{ColorTarget, DepthMap, DepthStencil, Screen};
 use crate::{format::morton_offset, GpuMemory};
 
-const VERTEX_SHADER: &str = r#"#version 330 core
+const VERTEX_SHADER: &str = r#"#version 430 core
 layout(location = 0) in vec4 packed_a; // position over w, inverse w, z
 layout(location = 1) in vec4 packed_b; // color
 layout(location = 2) in vec4 packed_c; // texture coords of sets 0 and 1
 layout(location = 3) in vec4 packed_d; // texture coord set 2, set 0's w
+layout(location = 4) in vec4 packed_e; // the surface quaternion over w
+layout(location = 5) in vec4 packed_f; // the view vector over w
 out vec4 vertex_color;
  noperspective out float pica_depth;
  noperspective out float pica_inverse_w;
@@ -19,6 +21,8 @@ out vec2 uv0;
 out vec2 uv1;
 out vec2 uv2;
 out float q0;
+out vec4 quaternion;
+out vec3 view;
 void main() {
     gl_Position = vec4(packed_a.xy, 0.0, 1.0 / packed_a.z);
     vertex_color = packed_b;
@@ -28,6 +32,8 @@ void main() {
     uv1 = packed_c.zw;
     uv2 = packed_d.xy;
     q0 = packed_d.z;
+    quaternion = packed_e;
+    view = packed_f.xyz;
 }
 "#;
 
@@ -38,7 +44,7 @@ void main() {
 /// wrap texel indices, not GL's normalized coordinates, and the level of
 /// detail comes from the rate the coordinates change across the screen like
 /// `BoundTexture::sample_at` works it
-const FRAGMENT_SHADER: &str = r#"#version 330 core
+const FRAGMENT_SHADER: &str = r#"#version 430 core
 in vec4 vertex_color;
  noperspective in float pica_depth;
  noperspective in float pica_inverse_w;
@@ -46,18 +52,21 @@ in vec2 uv0;
 in vec2 uv1;
 in vec2 uv2;
 in float q0;
+in vec4 quaternion;
+in vec3 view;
 uniform float depth_scale;
 uniform float depth_offset;
 uniform bool w_buffer;
 uniform bool alpha_test;
 uniform int alpha_function;
 uniform int alpha_reference;
-// the texture units: samplers are named one by one (GLSL 330 cannot index an
-// array of them dynamically), the rest of each unit's configuration is an array
+// the texture units: samplers are named one by one (the LUT rides unit 3), the
+// rest of each unit's configuration is an array
 uniform int tex_enabled[3];
 uniform sampler2D tex_image0;
 uniform sampler2D tex_image1;
 uniform sampler2D tex_image2;
+uniform sampler2D lut_image;
 uniform vec2 tex_size[3];
 // x: the level of detail bias in levels, y: the smallest level, z: the largest,
 // w: whether the two levels about the level blend
@@ -83,7 +92,203 @@ uniform float tev_alpha_scales[6];
 uniform int tev_passthrough[6];
 uniform int tev_update_mask;
 uniform vec4 tev_buffer_color;
+// fragment lighting, the words `Lighting::pack` lays out: the config, the count
+// and the bump and shadow words, the fresnel and highlight flags, the seven
+// table lookups (read, its input, abs, scale bits), the global ambient, then
+// per light eight vec4s (its colors, position, direction, spotlight and the
+// distance bias and scale) and two words of flags and number
+uniform int lighting_active;
+uniform uvec4 light_head;
+uniform uvec4 light_flags;
+uniform uvec4 light_lookups[7];
+uniform vec4 light_ambient;
+uniform vec4 light_data[64];
+uniform uint light_meta[16];
+// the fog, by the fragment's depth thru the LUT texture's last row
+uniform int fog_active;
+uniform int fog_flip;
+uniform vec3 fog_color;
 out vec4 color;
+// rows 0 to 23 are the lighting tables, the fog's 128 entries share the last
+const uint FOG_ROW = 24u;
+const uint DISTRIBUTION0 = 0u;
+const uint DISTRIBUTION1 = 1u;
+const uint FRESNEL = 3u;
+const uint REFLECT_BLUE = 4u;
+const uint REFLECT_GREEN = 5u;
+const uint REFLECT_RED = 6u;
+const uint SPOTLIGHT = 8u;
+const uint DISTANCE = 16u;
+/// a lighting table's value at an entry plus the step toward the next one,
+/// taken out of the shared LUT texture
+float lut_lookup(uint table, uint entry, float delta) {
+    vec2 value = texelFetch(lut_image, ivec2(int(entry), int(table)), 0).rg;
+    precise float found = value.x + value.y * delta;
+    return found;
+}
+vec3 rotate(vec4 q, vec3 v) {
+    vec3 inner = cross(q.xyz, v);
+    precise vec3 turned = v + 2.0 * cross(q.xyz, inner + v * q.w);
+    return turned;
+}
+float quantize(float c) {
+    precise float scaled = floor(clamp(c, 0.0, 1.0) * 255.0);
+    return scaled / 255.0;
+}
+/// one light's packed vec4, its colors, position, direction, spotlight and
+/// distance, seven to a light in `light_data`
+vec3 light_rgb(uint light, uint which) {
+    return light_data[light * 8u + which].xyz;
+}
+/// what fragment lighting leaves in the primary and secondary colors, the same
+/// math `Lighting::shade` runs: the surface quaternion and view vector the
+/// vertices interpolated, the textures what the units sampled there
+void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
+    uint config = light_head.x;
+    float length_q = length(quaternion);
+    vec4 q = length_q > 0.0 ? quaternion / length_q : vec4(0.0, 0.0, 0.0, 1.0);
+    uint shadow_word = light_head.w;
+    vec4 shadow = vec4(1.0);
+    if ((shadow_word & 1u) != 0u) {
+        shadow = textures[(shadow_word >> 4) & 3u];
+        if ((shadow_word & 0x100u) != 0u) {
+            shadow = vec4(1.0) - shadow;
+        }
+    }
+    vec3 surface_normal = vec3(0.0, 0.0, 1.0);
+    vec3 surface_tangent = vec3(1.0, 0.0, 0.0);
+    uint bump = light_head.z;
+    uint bump_mode = bump & 3u;
+    if (bump_mode == 1u) {
+        surface_normal = textures[(bump >> 4) & 3u].xyz * 2.0 - 1.0;
+        if ((bump & 0x100u) != 0u) {
+            surface_normal.z = sqrt(max(1.0 - dot(surface_normal.xy, surface_normal.xy), 0.0));
+        }
+    } else if (bump_mode == 2u) {
+        surface_tangent = textures[(bump >> 4) & 3u].xyz * 2.0 - 1.0;
+    }
+    vec3 normal = rotate(q, surface_normal);
+    // only the last configuration has a table that reads the tangent
+    vec3 tangent = config == 8u ? rotate(q, surface_tangent) : surface_tangent;
+    bool needs_half = (light_flags.w & 1u) != 0u;
+    bool needs_view = (light_flags.w & 2u) != 0u;
+    vec3 norm_view = needs_view ? normalize(view) : vec3(0.0);
+    precise vec4 diffuse_sum = vec4(0.0, 0.0, 0.0, 1.0);
+    precise vec4 specular_sum = vec4(0.0, 0.0, 0.0, 1.0);
+    uint count = light_head.y;
+    for (uint light = 0u; light < count; light++) {
+        uint flags = light_meta[light * 2u];
+        uint number = light_meta[light * 2u + 1u];
+        bool two_sided = (flags & 2u) != 0u;
+        vec3 position = light_rgb(light, 4u);
+        vec3 light_vector = (flags & 1u) != 0u ? light_rgb(light, 5u) : normalize(position + view);
+        vec3 half_vector = vec3(0.0);
+        vec3 half_unit = vec3(0.0);
+        if (needs_half) {
+            half_vector = norm_view + light_vector;
+            half_unit = normalize(half_vector);
+        }
+        float distance = 1.0;
+        if ((flags & 16u) != 0u) {
+            vec3 offset = -view - position;
+            vec2 bias_scale = light_data[light * 8u + 7u].xy;
+            float place = clamp(bias_scale.y * length(offset) + bias_scale.x, 0.0, 1.0);
+            float entry = clamp(floor(place * 256.0), 0.0, 255.0);
+            distance = lut_lookup(DISTANCE + number, uint(entry), place * 256.0 - entry);
+        }
+        float values[7];
+        for (uint i = 0u; i < 7u; i++) {
+            values[i] = 1.0;
+            uvec4 lookup = light_lookups[i];
+            if (lookup.x == 0u || (i == 6u && (flags & 32u) == 0u)) {
+                continue;
+            }
+            float result = 0.0;
+            switch (lookup.y) {
+                case 0u: result = dot(normal, half_unit); break;
+                case 1u: result = dot(norm_view, half_unit); break;
+                case 2u: result = dot(normal, norm_view); break;
+                case 3u: result = dot(light_vector, normal); break;
+                case 4u: result = dot(light_vector, light_rgb(light, 6u)); break;
+                case 5u:
+                    if (config == 8u) {
+                        float along = dot(normal, half_unit);
+                        result = dot(half_unit - normal * along, tangent);
+                    }
+                    break;
+                default: break;
+            }
+            uint entry;
+            float delta;
+            if (lookup.z != 0u) {
+                result = two_sided ? abs(result) : max(result, 0.0);
+                float found = clamp(floor(result * 256.0), 0.0, 255.0);
+                entry = uint(found);
+                delta = result * 256.0 - found;
+            } else {
+                // the signed index wraps into the upper half of the table
+                float found = clamp(floor(result * 128.0), -128.0, 127.0);
+                entry = uint(int(found)) & 0xFFu;
+                delta = result * 128.0 - found;
+            }
+            uint table = i == 0u ? DISTRIBUTION0
+                : i == 1u ? DISTRIBUTION1
+                : i == 2u ? FRESNEL
+                : i == 3u ? REFLECT_RED
+                : i == 4u ? REFLECT_GREEN
+                : i == 5u ? REFLECT_BLUE
+                : SPOTLIGHT + number;
+            values[i] = uintBitsToFloat(lookup.w) * lut_lookup(table, entry, delta);
+        }
+        float spot = values[6];
+        float red = values[3];
+        vec3 reflect_color = vec3(red,
+            light_lookups[4].x != 0u ? values[4] : red,
+            light_lookups[5].x != 0u ? values[5] : red);
+        vec3 specular0 = light_rgb(light, 0u) * values[0];
+        vec3 specular1 = values[1] * reflect_color * light_rgb(light, 1u);
+        // only the last light applies fresnel
+        if (light == count - 1u && light_lookups[2].x != 0u) {
+            if (light_flags.x != 0u) {
+                diffuse_sum.a = values[2];
+            }
+            if (light_flags.y != 0u) {
+                specular_sum.a = values[2];
+            }
+        }
+        float facing = dot(light_vector, normal);
+        facing = two_sided ? abs(facing) : max(facing, 0.0);
+        float highlights = light_flags.z != 0u && facing == 0.0 ? 0.0 : 1.0;
+        if ((flags & 12u) != 0u) {
+            float squared = dot(half_vector, half_vector);
+            float factor = squared == 0.0 ? 0.0 : min(facing / squared, 1.0);
+            if ((flags & 4u) != 0u) {
+                specular0 *= factor;
+            }
+            if ((flags & 8u) != 0u) {
+                specular1 *= factor;
+            }
+        }
+        bool shadowed = (flags & 64u) != 0u && (shadow_word & 1u) != 0u;
+        vec3 shadow_primary = shadowed && (shadow_word & 0x200u) != 0u ? shadow.rgb : vec3(1.0);
+        vec3 shadow_secondary = shadowed && (shadow_word & 0x400u) != 0u ? shadow.rgb : vec3(1.0);
+        vec3 diffuse = (light_rgb(light, 2u) * facing + light_rgb(light, 3u)) * distance * spot;
+        vec3 specular = (specular0 + specular1) * highlights * distance * spot;
+        diffuse_sum.rgb += diffuse * shadow_primary;
+        specular_sum.rgb += specular * shadow_secondary;
+    }
+    if ((shadow_word & 0x800u) != 0u) {
+        if (light_flags.x != 0u) {
+            diffuse_sum.a *= shadow.a;
+        }
+        if (light_flags.y != 0u) {
+            specular_sum.a *= shadow.a;
+        }
+    }
+    diffuse_sum.rgb += light_ambient.rgb;
+    diffuse_out = vec4(quantize(diffuse_sum.r), quantize(diffuse_sum.g), quantize(diffuse_sum.b), quantize(diffuse_sum.a));
+    specular_out = vec4(quantize(specular_sum.r), quantize(specular_sum.g), quantize(specular_sum.b), quantize(specular_sum.a));
+}
 bool alpha_passes(int value, int reference) {
     if (alpha_function == 0) return false;
     if (alpha_function == 1) return true;
@@ -166,17 +371,18 @@ vec4 sample_unit(sampler2D image, int unit, vec2 coord) {
 /// where one of a stage's inputs comes from: 0 the vertex color, 1 to 3 the
 /// texture units, 4 texture 3 (procedural textures stay on the CPU), 5 the
 /// combiner buffer, 6 the stage constant, 7 the previous stage, 8 and 9 the
-/// fragment lighting colors no draw that reaches this shader turns on
-vec4 pick(int source, vec4 primary, vec4 t0, vec4 t1, vec4 t2, vec4 buffer, vec4 constant, vec4 previous) {
+/// fragment lighting colors, answered from the vertex color and black when no
+/// lighting ran, like `TexEnv::apply` does
+vec4 pick(int source, vec4 primary, vec4 fragment_primary, vec4 fragment_secondary, vec4 t0, vec4 t1, vec4 t2, vec4 held, vec4 constant, vec4 previous) {
     if (source == 0) return primary;
     if (source == 1) return t0;
     if (source == 2) return t1;
     if (source == 3) return t2;
     if (source == 4) return vec4(0.0, 0.0, 0.0, 1.0);
-    if (source == 5) return buffer;
+    if (source == 5) return held;
     if (source == 6) return constant;
-    if (source == 8) return primary;
-    if (source == 9) return vec4(0.0, 0.0, 0.0, 1.0);
+    if (source == 8) return fragment_primary;
+    if (source == 9) return fragment_secondary;
     return previous;
 }
 vec3 color_operand(vec4 v, int op) {
@@ -230,18 +436,18 @@ float combine_alpha(int op, float v0, float v1, float v2) {
     return min(v0 + v1, 1.0) * v2;
 }
 /// runs the six stages over one fragment, the buffer a stage or two behind, like `apply`
-vec4 tev_combine(vec4 primary, vec4 t0, vec4 t1, vec4 t2) {
+vec4 tev_combine(vec4 primary, vec4 fragment_primary, vec4 fragment_secondary, vec4 t0, vec4 t1, vec4 t2) {
     vec4 previous = primary;
-    vec4 buffer = vec4(0.0);
+    vec4 held = vec4(0.0);
     vec4 next_buffer = tev_buffer_color;
     for (int i = 0; i < 6; i++) {
         if (tev_passthrough[i] == 0) {
-            vec4 c0 = pick(tev_color_sources[i * 3 + 0], primary, t0, t1, t2, buffer, tev_constants[i], previous);
-            vec4 c1 = pick(tev_color_sources[i * 3 + 1], primary, t0, t1, t2, buffer, tev_constants[i], previous);
-            vec4 c2 = pick(tev_color_sources[i * 3 + 2], primary, t0, t1, t2, buffer, tev_constants[i], previous);
-            vec4 a0 = pick(tev_alpha_sources[i * 3 + 0], primary, t0, t1, t2, buffer, tev_constants[i], previous);
-            vec4 a1 = pick(tev_alpha_sources[i * 3 + 1], primary, t0, t1, t2, buffer, tev_constants[i], previous);
-            vec4 a2 = pick(tev_alpha_sources[i * 3 + 2], primary, t0, t1, t2, buffer, tev_constants[i], previous);
+            vec4 c0 = pick(tev_color_sources[i * 3 + 0], primary, fragment_primary, fragment_secondary, t0, t1, t2, held, tev_constants[i], previous);
+            vec4 c1 = pick(tev_color_sources[i * 3 + 1], primary, fragment_primary, fragment_secondary, t0, t1, t2, held, tev_constants[i], previous);
+            vec4 c2 = pick(tev_color_sources[i * 3 + 2], primary, fragment_primary, fragment_secondary, t0, t1, t2, held, tev_constants[i], previous);
+            vec4 a0 = pick(tev_alpha_sources[i * 3 + 0], primary, fragment_primary, fragment_secondary, t0, t1, t2, held, tev_constants[i], previous);
+            vec4 a1 = pick(tev_alpha_sources[i * 3 + 1], primary, fragment_primary, fragment_secondary, t0, t1, t2, held, tev_constants[i], previous);
+            vec4 a2 = pick(tev_alpha_sources[i * 3 + 2], primary, fragment_primary, fragment_secondary, t0, t1, t2, held, tev_constants[i], previous);
             vec3 rgb = combine_rgb(tev_color_ops[i],
                 color_operand(c0, tev_color_operands[i * 3 + 0]),
                 color_operand(c1, tev_color_operands[i * 3 + 1]),
@@ -254,7 +460,7 @@ vec4 tev_combine(vec4 primary, vec4 t0, vec4 t1, vec4 t2) {
                     alpha_operand(a2, tev_alpha_operands[i * 3 + 2]));
             previous = vec4(clamp(rgb * tev_color_scales[i], 0.0, 1.0), clamp(alpha * tev_alpha_scales[i], 0.0, 1.0));
         }
-        buffer = next_buffer;
+        held = next_buffer;
         if (i < 4) {
             if ((tev_update_mask & (1 << i)) != 0) next_buffer.rgb = previous.rgb;
             if ((tev_update_mask & (1 << (i + 4))) != 0) next_buffer.a = previous.a;
@@ -268,7 +474,10 @@ void main() {
     gl_FragDepth = clamp(depth, 0.0, 1.0);
     vec4 primary = clamp(vertex_color, 0.0, 1.0);
     vec4 result = primary;
-    if (tev_active == 1) {
+    vec4 fragment_primary = primary;
+    // w/o fragment lighting there's no specular term
+    vec4 fragment_secondary = vec4(0.0, 0.0, 0.0, 1.0);
+    if (tev_active == 1 || lighting_active == 1) {
         vec4 t0 = vec4(0.0, 0.0, 0.0, 1.0);
         vec4 t1 = t0;
         vec4 t2 = t0;
@@ -278,12 +487,31 @@ void main() {
         }
         if (tex_enabled[1] == 1) t1 = sample_unit(tex_image1, 1, uv1);
         if (tex_enabled[2] == 1) t2 = sample_unit(tex_image2, 2, uv2);
-        result = tev_combine(primary, t0, t1, t2);
+        if (lighting_active == 1) {
+            // a lighting shadow or bump map on unit 3 reads the procedural
+            // texture's spot, which stays on the CPU, so unit 3 is the default
+            // texel here whenever lighting reaches this shader
+            vec4 textures[4] = vec4[4](t0, t1, t2, vec4(0.0, 0.0, 0.0, 1.0));
+            shade(textures, fragment_primary, fragment_secondary);
+        }
+        if (tev_active == 1) {
+            result = tev_combine(primary, fragment_primary, fragment_secondary, t0, t1, t2);
+        }
     }
     // the color leaves as whole bytes, like the software path truncates, so the
     // alpha test judges the same byte a fallback draw would
     vec4 quantized = floor(clamp(result, 0.0, 1.0) * 255.0);
     if (alpha_test && !alpha_passes(int(quantized.a), alpha_reference)) discard;
+    // the fog mixes in after the alpha test judged the fragment, by its depth
+    // thru the LUT's last row, the table's factor of the color and the rest of
+    // the fog's, like `Fog::apply` does
+    if (fog_active == 1) {
+        precise float index = (fog_flip == 1 ? 1.0 - clamp(depth, 0.0, 1.0) : clamp(depth, 0.0, 1.0)) * 128.0;
+        precise float entry = clamp(floor(index), 0.0, 127.0);
+        vec2 lookup = texelFetch(lut_image, ivec2(int(entry), int(FOG_ROW)), 0).rg;
+        precise float factor = clamp(lookup.x + lookup.y * (index - entry), 0.0, 1.0);
+        quantized.rgb = floor(factor * quantized.rgb + (1.0 - factor) * fog_color);
+    }
     color = quantized / 255.0;
 }
 "#;
@@ -292,6 +520,9 @@ const SURFACE_CACHE_BUDGET: u64 = 128 * 1024 * 1024;
 /// decoded textures stay resident under this, about as much as the decoded
 /// texel cache the CPU keeps draws from
 const TEXTURE_CACHE_BUDGET: u64 = 64 * 1024 * 1024;
+/// the row of the shared LUT texture the fog's 128 entries sit on, under the
+/// 24 lighting tables of 256 entries each
+const FOG_ROW: i32 = 24;
 
 /// one texture unit of a draw, its decoded texels and the sampling configuration
 /// the shader runs. The texels are the CPU decoder's own output — the GL texture
@@ -328,6 +559,19 @@ pub(crate) struct TextureSetup {
     /// texture unit 2 reads coordinate set 1 instead of its own
     pub texture2_uses_coord1: bool,
     pub tev: crate::tev::TevUniforms,
+}
+
+/// the fragment stages past the units and combiners: fragment lighting, its
+/// lookup tables and the fog. The lighting's words go up only when a draw
+/// decodes different ones, and the tables into a shared LUT texture only when
+/// an entry changed, both tracked since the last draw.
+pub(crate) struct FragmentSetup<'a> {
+    /// the lighting decoded from the registers, None when no combiner reads it
+    pub lighting: Option<&'a crate::lighting::Lighting>,
+    /// the lighting tables, rows of the shared LUT texture
+    pub tables: &'a crate::lighting::Tables,
+    /// the fog, None when the mode doesn't mix any in
+    pub fog: Option<&'a crate::fog::Fog<'a>>,
 }
 
 /// a GL texture holding one upload of decoded texels, kept for later draws
@@ -373,6 +617,16 @@ struct Uniforms {
     tev_passthrough: Option<glow::UniformLocation>,
     tev_update_mask: Option<glow::UniformLocation>,
     tev_buffer_color: Option<glow::UniformLocation>,
+    lighting_active: Option<glow::UniformLocation>,
+    light_head: Option<glow::UniformLocation>,
+    light_flags: Option<glow::UniformLocation>,
+    light_lookups: Option<glow::UniformLocation>,
+    light_ambient: Option<glow::UniformLocation>,
+    light_data: Option<glow::UniformLocation>,
+    light_meta: Option<glow::UniformLocation>,
+    fog_active: Option<glow::UniformLocation>,
+    fog_flip: Option<glow::UniformLocation>,
+    fog_color: Option<glow::UniformLocation>,
 }
 
 /// what happens to a fragment once the shader is done w/ it: the alpha test, how
@@ -517,6 +771,19 @@ pub(crate) struct OpenGlRasterizer {
     texture_budget: u64,
     /// the combiners the last draw set, so draws that keep them skip the arrays
     last_tev: Option<crate::tev::TevUniforms>,
+    /// the lighting and fog tables, one shared texture rows wide: 24 lighting
+    /// tables of 256 entries, then the fog's 128 on the last row
+    lookup_tables: glow::Texture,
+    /// the lighting tables these rows hold, so an entry rewritten between draws
+    /// is the one row that uploads again
+    lut_tables_id: u64,
+    lut_tables_changed: [u64; crate::lighting::TABLES],
+    /// the fog table's generation the last row holds
+    lut_fog_generation: u64,
+    /// the lighting words the last draw set, draws that keep them skip the arrays
+    last_lighting: Option<Vec<u32>>,
+    /// the fog the last draw set
+    last_fog: Option<([f32; 3], bool)>,
 }
 
 impl Drop for OpenGlRasterizer {
@@ -535,6 +802,7 @@ impl Drop for OpenGlRasterizer {
             }
         }
         unsafe {
+            self.gl.delete_texture(self.lookup_tables);
             self.gl.delete_vertex_array(self.vertex_array);
             self.gl.delete_buffer(self.vertices);
             self.gl.delete_program(self.program);
@@ -591,12 +859,13 @@ impl OpenGlRasterizer {
                 }
             };
 
-            // four whole vec4s a vertex: position over w, inverse w, z, the color,
-            // then two texture coordinate sets and set 0's w
+            // six whole vec4s a vertex: position over w, inverse w, z, the color,
+            // then two texture coordinate sets and set 0's w, the surface
+            // quaternion over w and the view vector over w
             gl.bind_vertex_array(Some(vertex_array));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertices));
-            let stride = (16 * size_of::<f32>()) as i32;
-            for attribute in 0..4 {
+            let stride = (24 * size_of::<f32>()) as i32;
+            for attribute in 0..6 {
                 gl.enable_vertex_attrib_array(attribute);
                 gl.vertex_attrib_pointer_f32(
                     attribute,
@@ -609,7 +878,8 @@ impl OpenGlRasterizer {
             }
             gl.bind_vertex_array(None);
 
-            // the samplers ride units 0 to 2, set once after the link
+            // the samplers ride units 0 to 2 and the lighting and fog LUT unit 3,
+            // set once after the link
             gl.use_program(Some(program));
             for unit in 0..3 {
                 if let Some(location) =
@@ -618,6 +888,44 @@ impl OpenGlRasterizer {
                     gl.uniform_1_i32(Some(&location), unit as i32);
                 }
             }
+            if let Some(location) = gl.get_uniform_location(program, "lut_image") {
+                gl.uniform_1_i32(Some(&location), 3);
+            }
+            let lookup_tables = match gl.create_texture() {
+                Ok(texture) => texture,
+                Err(error) => {
+                    gl.delete_buffer(vertices);
+                    gl.delete_vertex_array(vertex_array);
+                    gl.delete_program(program);
+                    return Err(error.to_string());
+                }
+            };
+            gl.active_texture(glow::TEXTURE3);
+            gl.bind_texture(glow::TEXTURE_2D, Some(lookup_tables));
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            // empty is zero, every entry a zero value with a zero step
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RG32F as i32,
+                256,
+                25,
+                0,
+                glow::RG,
+                glow::FLOAT,
+                glow::PixelUnpackData::Slice(None),
+            );
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.active_texture(glow::TEXTURE0);
             let uniforms = Uniforms {
                 depth_scale: gl.get_uniform_location(program, "depth_scale"),
                 depth_offset: gl.get_uniform_location(program, "depth_offset"),
@@ -653,6 +961,16 @@ impl OpenGlRasterizer {
                 tev_passthrough: gl.get_uniform_location(program, "tev_passthrough[0]"),
                 tev_update_mask: gl.get_uniform_location(program, "tev_update_mask"),
                 tev_buffer_color: gl.get_uniform_location(program, "tev_buffer_color"),
+                lighting_active: gl.get_uniform_location(program, "lighting_active"),
+                light_head: gl.get_uniform_location(program, "light_head"),
+                light_flags: gl.get_uniform_location(program, "light_flags"),
+                light_lookups: gl.get_uniform_location(program, "light_lookups[0]"),
+                light_ambient: gl.get_uniform_location(program, "light_ambient"),
+                light_data: gl.get_uniform_location(program, "light_data[0]"),
+                light_meta: gl.get_uniform_location(program, "light_meta[0]"),
+                fog_active: gl.get_uniform_location(program, "fog_active"),
+                fog_flip: gl.get_uniform_location(program, "fog_flip"),
+                fog_color: gl.get_uniform_location(program, "fog_color"),
             };
 
             Ok(Self {
@@ -669,6 +987,12 @@ impl OpenGlRasterizer {
                 texture_bytes: 0,
                 texture_budget: TEXTURE_CACHE_BUDGET,
                 last_tev: None,
+                lookup_tables,
+                lut_tables_id: u64::MAX,
+                lut_tables_changed: [u64::MAX; crate::lighting::TABLES],
+                lut_fog_generation: u64::MAX,
+                last_lighting: None,
+                last_fog: None,
             })
         }
     }
@@ -681,15 +1005,17 @@ impl OpenGlRasterizer {
         depth_map: DepthMap,
         output: &OutputState,
         textures: &TextureSetup,
+        fragment: &FragmentSetup,
         triangles: &[[Screen; 3]],
     ) -> Result<(), String> {
         if triangles.is_empty() || target.right <= target.left || target.top <= target.bottom {
             return Ok(());
         }
         let (width, height) = (target.buffer_width, target.buffer_height);
+        let bytes_per_pixel = target.format.bytes_per_pixel() as u32;
         let pixels = width
             .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(4))
+            .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
             .and_then(|bytes| usize::try_from(bytes).ok())
             .ok_or("OpenGL target dimensions overflow")?;
         let key = SurfaceKey {
@@ -760,7 +1086,7 @@ impl OpenGlRasterizer {
             Vec::new()
         } else {
             memory.read(target.addr, &mut tiled);
-            tiled_to_linear(&tiled, width, height)
+            tiled_to_linear(&tiled, width, height, target.format)
         };
         let depth_linear = if !initialized && key.depth_bytes != 0 {
             let mut depth_tiled = vec![0; (width * height * key.depth_bytes) as usize];
@@ -775,10 +1101,25 @@ impl OpenGlRasterizer {
             None
         };
 
-        let mut vertices = Vec::with_capacity(triangles.len() * 3 * 16);
+        let mut vertices = Vec::with_capacity(triangles.len() * 3 * 24);
         let set2 = if textures.texture2_uses_coord1 { 1 } else { 2 };
         for triangle in triangles {
-            for vertex in triangle {
+            // q and -q are the same orientation but halfway between them isn't,
+            // so the quaternions all go to the first vertex's side, the way the
+            // software rasterizer turns them before it interpolates
+            let first = triangle[0].quaternion_over_w;
+            let hemisphere = |vertex: &Screen| {
+                let same = (0..4)
+                    .map(|i| vertex.quaternion_over_w[i] * first[i])
+                    .sum::<f32>();
+                if same < 0.0 {
+                    vertex.quaternion_over_w.map(|component| -component)
+                } else {
+                    vertex.quaternion_over_w
+                }
+            };
+            let quaternions = [first, hemisphere(&triangle[1]), hemisphere(&triangle[2])];
+            for (vertex, quaternion_over_w) in triangle.iter().zip(quaternions) {
                 let inverse_w = vertex.inv_w;
                 vertices.extend([
                     (2.0 * vertex.x / width as f32 - 1.0) / inverse_w,
@@ -800,6 +1141,13 @@ impl OpenGlRasterizer {
                     vertex.texcoord0_w_over_w / inverse_w,
                     0.0,
                 ]);
+                vertices.extend(quaternion_over_w.map(|component| component / inverse_w));
+                vertices.extend([
+                    vertex.view_over_w[0] / inverse_w,
+                    vertex.view_over_w[1] / inverse_w,
+                    vertex.view_over_w[2] / inverse_w,
+                    0.0,
+                ]);
             }
         }
         let vertex_bytes = bytemuck::cast_slice(&vertices);
@@ -808,6 +1156,18 @@ impl OpenGlRasterizer {
         // long as the CPU decoder hands out the same texels
         let bound = self.bind_textures(textures)?;
         let tev_changed = self.last_tev.as_ref() != Some(&textures.tev);
+        // the lighting and fog tables into the LUT texture, a changed row only,
+        // then the words the lighting state packed into, only when a draw
+        // decoded different ones
+        self.upload_luts(fragment.lighting, fragment.tables, fragment.fog)?;
+        let lighting_words = fragment.lighting.map(|lighting| {
+            let mut words = Vec::new();
+            lighting.pack(&mut words);
+            words
+        });
+        let lighting_changed = lighting_words != self.last_lighting;
+        let fog_state = fragment.fog.map(|fog| (fog.color, fog.flip));
+        let fog_update = fog_state.filter(|fog| self.last_fog.as_ref() != Some(fog));
 
         let framebuffer_complete = unsafe {
             let gl = &self.gl;
@@ -899,11 +1259,17 @@ impl OpenGlRasterizer {
                 gl.disable(glow::CULL_FACE);
                 gl.disable(glow::DITHER);
                 gl.disable(glow::FRAMEBUFFER_SRGB);
+                // a guest RGB8 target has no alpha byte to store, so the alpha
+                // channel of the GL's RGBA8 copy keeps the 255 the guest decodes
+                // instead, and no draw may write it: a blend factor reading the
+                // destination alpha then sees the 1.0 the software path sees
+                let alpha_writable =
+                    output.write[3] && target.format != crate::format::ColorFormat::Rgb8;
                 gl.color_mask(
                     output.write[0],
                     output.write[1],
                     output.write[2],
-                    output.write[3],
+                    alpha_writable,
                 );
                 match &output.blend {
                     Some(blend) => {
@@ -957,6 +1323,25 @@ impl OpenGlRasterizer {
                     );
                 }
                 self.set_texture_uniforms(textures, tev_changed);
+                if let Some(location) = &self.uniforms.lighting_active {
+                    gl.uniform_1_i32(Some(location), fragment.lighting.is_some() as i32);
+                }
+                if lighting_changed {
+                    if let Some(words) = &lighting_words {
+                        self.set_lighting_uniforms(words);
+                    }
+                }
+                if let Some(location) = &self.uniforms.fog_active {
+                    gl.uniform_1_i32(Some(location), fragment.fog.is_some() as i32);
+                }
+                if let Some((color, flip)) = &fog_update {
+                    if let Some(location) = &self.uniforms.fog_flip {
+                        gl.uniform_1_i32(Some(location), *flip as i32);
+                    }
+                    if let Some(location) = &self.uniforms.fog_color {
+                        gl.uniform_3_f32_slice(Some(location), color);
+                    }
+                }
                 for (unit, texture) in bound.iter().enumerate() {
                     let Some(texture) = texture else { continue };
                     let Some(setup) = textures.units[unit].as_ref() else {
@@ -1003,7 +1388,7 @@ impl OpenGlRasterizer {
                         &setup.border,
                     );
                 }
-                gl.draw_arrays(glow::TRIANGLES, 0, (vertices.len() / 16) as i32);
+                gl.draw_arrays(glow::TRIANGLES, 0, (vertices.len() / 24) as i32);
                 gl.bind_vertex_array(None);
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 gl.disable(glow::SCISSOR_TEST);
@@ -1025,8 +1410,10 @@ impl OpenGlRasterizer {
         surface.dirty = true;
         surface.depth_dirty |= depth.is_some_and(|d| d.write_depth || d.write_stencil);
         self.last_tev = Some(textures.tev);
-        memory.guard(target.addr, (width * height * 4) as u32);
-        memory.guard_writes(target.addr, (width * height * 4) as u32);
+        self.last_lighting = lighting_words;
+        self.last_fog = fog_state;
+        memory.guard(target.addr, width * height * bytes_per_pixel);
+        memory.guard_writes(target.addr, width * height * bytes_per_pixel);
         if let Some(depth) = depth {
             let bytes = width.saturating_mul(height).saturating_mul(depth.bytes);
             memory.guard(depth.addr, bytes);
@@ -1034,6 +1421,130 @@ impl OpenGlRasterizer {
         }
         self.evict_to_budget(memory, 0);
         Ok(())
+    }
+
+    /// the lighting and fog tables into the shared LUT texture: a table with a
+    /// changed entry uploads its row again, the fog when its table changed, and
+    /// the texture stays bound to unit 3 for the draw
+    fn upload_luts(
+        &mut self,
+        lighting: Option<&crate::lighting::Lighting>,
+        tables: &crate::lighting::Tables,
+        fog: Option<&crate::fog::Fog>,
+    ) -> Result<(), String> {
+        unsafe {
+            let gl = &self.gl;
+            gl.active_texture(glow::TEXTURE3);
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.lookup_tables));
+            if lighting.is_some() {
+                let id = tables.id();
+                let changed = tables.changed();
+                if id != self.lut_tables_id {
+                    for table in 0..crate::lighting::TABLES {
+                        self.upload_table_row(table, tables)?;
+                    }
+                    self.lut_tables_changed = *changed;
+                    self.lut_tables_id = id;
+                } else {
+                    for table in 0..crate::lighting::TABLES {
+                        if changed[table] != self.lut_tables_changed[table] {
+                            self.upload_table_row(table, tables)?;
+                            self.lut_tables_changed[table] = changed[table];
+                        }
+                    }
+                }
+            }
+            if let Some(fog) = fog {
+                let generation = fog.table.generation();
+                if generation != self.lut_fog_generation {
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        0,
+                        FOG_ROW,
+                        crate::fog::ENTRIES as i32,
+                        1,
+                        glow::RG,
+                        glow::FLOAT,
+                        glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(
+                            fog.table.entries(),
+                        ))),
+                    );
+                    self.lut_fog_generation = generation;
+                }
+            }
+            gl.active_texture(glow::TEXTURE0);
+        }
+        Ok(())
+    }
+
+    /// one lighting table's 256 entries, a value and a step each, into its row
+    fn upload_table_row(
+        &self,
+        table: usize,
+        tables: &crate::lighting::Tables,
+    ) -> Result<(), String> {
+        let entries = tables
+            .entries()
+            .get(table)
+            .ok_or_else(|| "lighting table out of range".to_owned())?;
+        unsafe {
+            self.gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                table as i32,
+                256,
+                1,
+                glow::RG,
+                glow::FLOAT,
+                glow::PixelUnpackData::Slice(Some(bytemuck::cast_slice(entries))),
+            );
+        }
+        Ok(())
+    }
+
+    /// the lighting's words onto the shader's uniforms, the vec4s through the
+    /// bits they pack, the flags and numbers gathered out of each light's block
+    fn set_lighting_uniforms(&self, words: &[u32]) {
+        unsafe {
+            let gl = &self.gl;
+            let uniforms = &self.uniforms;
+            if let Some(location) = &uniforms.light_head {
+                gl.uniform_4_u32_slice(Some(location), &words[0..4]);
+            }
+            if let Some(location) = &uniforms.light_flags {
+                gl.uniform_4_u32_slice(Some(location), &words[4..8]);
+            }
+            if let Some(location) = &uniforms.light_lookups {
+                gl.uniform_4_u32_slice(Some(location), &words[8..36]);
+            }
+            if let Some(location) = &uniforms.light_ambient {
+                let ambient: [f32; 4] = words[36..40]
+                    .iter()
+                    .map(|word| f32::from_bits(*word))
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .expect("the global ambient is four words");
+                gl.uniform_4_f32_slice(Some(location), &ambient);
+            }
+            if let Some(location) = &uniforms.light_data {
+                let data: Vec<f32> = words[40..]
+                    .iter()
+                    .map(|word| f32::from_bits(*word))
+                    .collect();
+                gl.uniform_4_f32_slice(Some(location), &data);
+            }
+            if let Some(location) = &uniforms.light_meta {
+                let mut meta = [0u32; 16];
+                for (slot, pair) in meta.chunks_mut(2).enumerate() {
+                    let base = 40 + slot * 36;
+                    pair[0] = words[base + 32];
+                    pair[1] = words[base + 33];
+                }
+                gl.uniform_1_u32_slice(Some(location), &meta);
+            }
+        }
     }
 
     /// every unit's texture uploaded and in the cache, by unit, so the draw
@@ -1309,6 +1820,8 @@ impl OpenGlRasterizer {
         }
         self.texture_bytes = 0;
         self.last_tev = None;
+        self.last_lighting = None;
+        self.last_fog = None;
     }
 
     /// a smaller cache for the tests, which cannot draw the thousands of
@@ -1336,7 +1849,10 @@ impl OpenGlRasterizer {
             else {
                 break;
             };
-            let color_bytes = key.width.saturating_mul(key.height).saturating_mul(4);
+            let color_bytes = key
+                .width
+                .saturating_mul(key.height)
+                .saturating_mul(color_format(key.format).bytes_per_pixel() as u32);
             self.sync(memory, key.addr, color_bytes, false);
             if key.depth_bytes != 0 {
                 let depth_bytes = key
@@ -1381,7 +1897,10 @@ impl OpenGlRasterizer {
                 if Some(*key) == except {
                     return None;
                 }
-                let bytes = key.width.saturating_mul(key.height).saturating_mul(4);
+                let bytes = key
+                    .width
+                    .saturating_mul(key.height)
+                    .saturating_mul(color_format(key.format).bytes_per_pixel() as u32);
                 let color_overlap = addr < key.addr.saturating_add(bytes) && key.addr < end;
                 let color_hit = surface.dirty && color_overlap;
                 let depth_size = key
@@ -1398,10 +1917,11 @@ impl OpenGlRasterizer {
             .collect();
         for key in keys {
             let surface = self.surfaces.get_mut(&key).unwrap();
-            let (width, height) = (key.width, key.height);
+            let (width, height, format) = (key.width, key.height, color_format(key.format));
             if surface.dirty {
                 let mut linear = vec![0u8; (width * height * 4) as usize];
-                let mut tiled = vec![0u8; linear.len()];
+                let mut tiled =
+                    vec![0u8; (width * height * format.bytes_per_pixel() as u32) as usize];
                 unsafe {
                     self.gl
                         .bind_framebuffer(glow::FRAMEBUFFER, Some(surface.framebuffer));
@@ -1417,7 +1937,7 @@ impl OpenGlRasterizer {
                     );
                     self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 }
-                linear_to_tiled(&linear, &mut tiled, width, height);
+                linear_to_tiled(&linear, &mut tiled, width, height, format);
                 memory.write(key.addr, &tiled);
                 surface.dirty = false;
             }
@@ -1765,12 +2285,31 @@ fn linear_to_tiled_bytes(linear: &[u8], tiled: &mut [u8], width: u32, height: u3
     }
 }
 
-fn tiled_to_linear(tiled: &[u8], width: u32, height: u32) -> Vec<u8> {
+/// the color format a surface key's raw number holds, the enum's own numbering
+/// the key stores, not the registers'
+fn color_format(raw: u32) -> crate::format::ColorFormat {
+    match raw {
+        1 => crate::format::ColorFormat::Rgb8,
+        2 => crate::format::ColorFormat::Rgb565,
+        3 => crate::format::ColorFormat::Rgb5A1,
+        4 => crate::format::ColorFormat::Rgba4,
+        _ => crate::format::ColorFormat::Rgba8,
+    }
+}
+
+/// a surface's tiled guest pixels decode into linear RGBA rows for the upload
+fn tiled_to_linear(
+    tiled: &[u8],
+    width: u32,
+    height: u32,
+    format: crate::format::ColorFormat,
+) -> Vec<u8> {
+    let bytes_per_pixel = format.bytes_per_pixel();
     let mut linear = vec![0; (width * height * 4) as usize];
     for y in 0..height {
         for x in 0..width {
-            let source = morton_offset(x, height - 1 - y, width, 4) as usize;
-            let color = crate::format::ColorFormat::Rgba8.decode(&tiled[source..source + 4]);
+            let source = morton_offset(x, height - 1 - y, width, bytes_per_pixel as u32) as usize;
+            let color = format.decode(&tiled[source..source + bytes_per_pixel]);
             let destination = ((y * width + x) * 4) as usize;
             linear[destination..destination + 4].copy_from_slice(&color);
         }
@@ -1778,17 +2317,27 @@ fn tiled_to_linear(tiled: &[u8], width: u32, height: u32) -> Vec<u8> {
     linear
 }
 
-fn linear_to_tiled(linear: &[u8], tiled: &mut [u8], width: u32, height: u32) {
+/// linear RGBA rows pack back into the surface's tiled guest bytes
+fn linear_to_tiled(
+    linear: &[u8],
+    tiled: &mut [u8],
+    width: u32,
+    height: u32,
+    format: crate::format::ColorFormat,
+) {
+    let bytes_per_pixel = format.bytes_per_pixel();
     for y in 0..height {
         for x in 0..width {
             let source = ((y * width + x) * 4) as usize;
             let mut encoded = [0; 4];
-            crate::format::ColorFormat::Rgba8.encode(
+            format.encode(
                 linear[source..source + 4].try_into().expect("RGBA pixel"),
                 &mut encoded,
             );
-            let destination = morton_offset(x, height - 1 - y, width, 4) as usize;
-            tiled[destination..destination + 4].copy_from_slice(&encoded);
+            let destination =
+                morton_offset(x, height - 1 - y, width, bytes_per_pixel as u32) as usize;
+            tiled[destination..destination + bytes_per_pixel]
+                .copy_from_slice(&encoded[..bytes_per_pixel]);
         }
     }
 }
@@ -1811,8 +2360,10 @@ fn version_at_least(version: &str, major: u32, minor: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        depth_to_linear, linear_to_tiled, linear_to_tiled_bytes, tiled_to_linear, version_at_least,
+        color_format, depth_to_linear, linear_to_tiled, linear_to_tiled_bytes, tiled_to_linear,
+        version_at_least,
     };
+    use crate::format::ColorFormat;
 
     #[test]
     fn recognizes_required_opengl_versions() {
@@ -1822,16 +2373,50 @@ mod tests {
         assert!(!version_at_least("OpenGL ES 3.2", 4, 3));
     }
 
+    /// the surface key holds the enum's own numbers, not the registers'
+    #[test]
+    fn surface_keys_number_formats_like_the_enum() {
+        assert_eq!(color_format(ColorFormat::Rgba8 as u32), ColorFormat::Rgba8);
+        assert_eq!(color_format(ColorFormat::Rgb8 as u32), ColorFormat::Rgb8);
+        assert_eq!(
+            color_format(ColorFormat::Rgb565 as u32),
+            ColorFormat::Rgb565
+        );
+        assert_eq!(
+            color_format(ColorFormat::Rgb5A1 as u32),
+            ColorFormat::Rgb5A1
+        );
+        assert_eq!(color_format(ColorFormat::Rgba4 as u32), ColorFormat::Rgba4);
+    }
+
     #[test]
     fn tiled_rgba8_round_trips_through_linear_gl_rows() {
         for (width, height) in [(8, 8), (16, 8), (16, 16)] {
             let length = (width * height * 4) as usize;
             let tiled: Vec<u8> = (0..length).map(|i| (i * 37) as u8).collect();
-            let linear = tiled_to_linear(&tiled, width, height);
+            let linear = tiled_to_linear(&tiled, width, height, ColorFormat::Rgba8);
             let mut restored = vec![0; length];
-            linear_to_tiled(&linear, &mut restored, width, height);
+            linear_to_tiled(&linear, &mut restored, width, height, ColorFormat::Rgba8);
             assert_eq!(restored, tiled);
         }
+    }
+
+    /// an RGB8 target packs 3 bytes a texel into its tiles and unpacks the same
+    /// texels back out, through the RGBA rows the GL side holds them in
+    #[test]
+    fn tiled_rgb8_round_trips_through_linear_gl_rows() {
+        for (width, height) in [(8, 8), (16, 8), (24, 16)] {
+            let length = (width * height * 3) as usize;
+            let tiled: Vec<u8> = (0..length).map(|i| (i * 61 + 9) as u8).collect();
+            let linear = tiled_to_linear(&tiled, width, height, ColorFormat::Rgb8);
+            let mut restored = vec![0; length];
+            linear_to_tiled(&linear, &mut restored, width, height, ColorFormat::Rgb8);
+            assert_eq!(restored, tiled);
+        }
+        // and a decoded pixel is the format's own red, green and blue, opaque
+        let tiled = [0x11, 0x22, 0x33];
+        let linear = tiled_to_linear(&tiled, 1, 1, ColorFormat::Rgb8);
+        assert_eq!(&linear[..4], &[0x33, 0x22, 0x11, 0xFF]);
     }
 
     #[test]

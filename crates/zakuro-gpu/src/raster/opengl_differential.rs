@@ -480,13 +480,25 @@ fn resolve(resources: &mut Resources, memory: &mut CountingMemory, depth_bytes: 
 // reading the results back
 // ---------------------------------------------------------------------------
 
-/// the target's pixels in window order, top row first
+/// the target's pixels in window order, top row first, the raw guest bytes in
+/// the buffer's own ABGR order, alpha first and red last
 fn image(memory: &CountingMemory) -> Vec<[u8; 4]> {
     (0..BUFFER * BUFFER)
         .map(|sample| {
             let (x, y) = (sample % BUFFER, sample / BUFFER);
             let at = (COLOR + morton_offset(x, BUFFER - 1 - y, BUFFER, 4)) as usize;
             memory.flat[at..at + 4].try_into().expect("RGBA pixel")
+        })
+        .collect()
+}
+
+/// the RGB8 target's texels in window order, three raw guest bytes a pixel
+fn rgb8_image(memory: &CountingMemory) -> Vec<[u8; 3]> {
+    (0..BUFFER * BUFFER)
+        .map(|sample| {
+            let (x, y) = (sample % BUFFER, sample / BUFFER);
+            let at = (COLOR + morton_offset(x, BUFFER - 1 - y, BUFFER, 3)) as usize;
+            memory.flat[at..at + 3].try_into().expect("RGB pixel")
         })
         .collect()
 }
@@ -639,6 +651,81 @@ fn assert_images_identical(cpu: &CountingMemory, gl: &CountingMemory, what: &str
         "{what}: {} pixels differ, worst first: {:?}",
         differing.len(),
         &differing[..differing.len().min(8)],
+    );
+}
+
+/// the backends left the same RGB8 texels, exactly
+fn assert_rgb8_identical(cpu: &CountingMemory, gl: &CountingMemory, what: &str) {
+    let (cpu_pixels, gl_pixels) = (rgb8_image(cpu), rgb8_image(gl));
+    let differing: Vec<(u32, u32, [u8; 3], [u8; 3])> = (0..(BUFFER * BUFFER) as usize)
+        .filter(|&index| cpu_pixels[index] != gl_pixels[index])
+        .map(|index| {
+            (
+                index as u32 % BUFFER,
+                index as u32 / BUFFER,
+                cpu_pixels[index],
+                gl_pixels[index],
+            )
+        })
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "{what}: {} pixels differ, worst first: {:?}",
+        differing.len(),
+        &differing[..differing.len().min(8)],
+    );
+}
+
+/// interior RGB8 texels agree within `tolerance` a channel, and whatever else
+/// differs sits within a pixel of an edge, in the usual bounded count
+fn assert_rgb8_close(
+    cpu: &CountingMemory,
+    gl: &CountingMemory,
+    triangles: &[[Screen; 3]],
+    tolerance: u8,
+    what: &str,
+) {
+    let (cpu_pixels, gl_pixels) = (rgb8_image(cpu), rgb8_image(gl));
+    let mut differences: Vec<(u32, u32, [u8; 3], [u8; 3])> = Vec::new();
+    let mut edge_differences = 0usize;
+    for y in 0..BUFFER {
+        for x in 0..BUFFER {
+            let index = (y * BUFFER + x) as usize;
+            let off = cpu_pixels[index]
+                .iter()
+                .zip(gl_pixels[index].iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            if off <= tolerance {
+                continue;
+            }
+            if edge_distance(x, y, triangles) <= 1.0 {
+                edge_differences += 1;
+            } else {
+                differences.push((x, y, cpu_pixels[index], gl_pixels[index]));
+            }
+        }
+    }
+    let perimeter: f32 = triangles
+        .iter()
+        .map(|triangle| {
+            (0..3)
+                .map(|i| {
+                    let a = &triangle[i];
+                    let b = &triangle[(i + 1) % 3];
+                    (b.x - a.x).hypot(b.y - a.y)
+                })
+                .sum::<f32>()
+        })
+        .sum();
+    let bound = perimeter.ceil() as usize * 2 + 16;
+    assert!(
+        differences.is_empty() && edge_differences <= bound,
+        "{what}: {edge_differences} edge pixels differ (bound {bound}) and {} pixels off the \
+         edges do, worst first: {:?}",
+        differences.len(),
+        &differences[..differences.len().min(8)],
     );
 }
 
@@ -2690,22 +2777,23 @@ fn opengl_texture_cache_reuse_invalidation_and_eviction() {
         }
     }
 }
-/// a draw the OpenGL path cannot take — a logic op, a non-RGBA8 target, a blend
-/// factor GL lacks, fog, procedural textures or fragment lighting — falls back to
-/// the CPU rasterizer after syncing what the GL drew, and the bytes match a run
-/// that never saw the GL at all
+/// a draw the OpenGL path cannot take — a logic op, a 16 bit target, a blend
+/// factor GL lacks or procedural textures — falls back to the CPU rasterizer
+/// after syncing what the GL drew, and the bytes match a run that never saw the
+/// GL at all. Fragment lighting, the fog and RGB8 targets used to be on this
+/// list; they draw in the GL now, and their tests are differentials of their own.
 #[test]
 fn opengl_unsupported_draws_fall_back_after_syncing_and_match_the_cpu() {
     // (an unaligned target would join these, but the CPU rasterizer itself panics
     // on tile-unaligned widths today, see the ignored regression test and TODO.md)
     type StateChange = fn(&mut Vec<u32>);
-    let cases: [(&str, StateChange); 6] = [
+    let cases: [(&str, StateChange); 4] = [
         ("a logic op", |registers| {
             registers[REG_COLOR_OPERATION] = 0;
             registers[REG_LOGIC_OP] = 6; // XOR, not the copy that reads as none
         }),
-        ("an RGB8 target", |registers| {
-            registers[REG_COLOR_BUFFER_FORMAT] = 1 << 16;
+        ("an RGB565 target", |registers| {
+            registers[REG_COLOR_BUFFER_FORMAT] = 3 << 16;
         }),
         ("a blend factor GL lacks", |registers| {
             // GL takes the source alpha saturate factor as the color side's
@@ -2713,22 +2801,8 @@ fn opengl_unsupported_draws_fall_back_after_syncing_and_match_the_cpu() {
             registers[REG_COLOR_OPERATION] = 0x100;
             registers[REG_BLEND_FUNC] = 0x11E1_0000; // color side: add, one, the saturate factor as the destination
         }),
-        ("fog", |registers| {
-            registers[crate::fog::REG_MODE] = 5; // the mode that mixes the fog in
-        }),
         ("procedural textures", |registers| {
             registers[REG_TEXTURE_CONFIG] |= 1 << 10;
-        }),
-        ("fragment lighting", |registers| {
-            // the lighting on, and a combiner reading its colors, a stage
-            // modulating the primary fragment color w/ texture 0
-            registers[0x08F] = 1;
-            registers[0x0C0] = 0x0003_0013;
-            registers[0x0C2] = 1;
-            registers[REG_TEXTURE_CONFIG] = 1;
-            registers[TEXTURE_UNIT_BASES[0] + 1] = 8 | (8 << 16);
-            registers[TEXTURE_UNIT_BASES[0] + 4] = 0x6000 >> 3;
-            registers[TEXTURE_UNIT_BASES[0] + 13] = 0; // RGBA8
         }),
     ];
     for (name, apply) in cases {
@@ -2844,6 +2918,11 @@ fn opengl_overlapping_surfaces_resolve_each_other() {
             ..Default::default()
         },
     };
+    let fragment = opengl::FragmentSetup {
+        lighting: None,
+        tables: &resources.light_tables,
+        fog: None,
+    };
     {
         let renderer = resources.opengl.as_mut().unwrap();
         // A: color at 0x1000 and D16 depth at 0x3000
@@ -2855,6 +2934,7 @@ fn opengl_overlapping_surfaces_resolve_each_other() {
                 map,
                 &output,
                 &textures,
+                &fragment,
                 &[screen_triangle],
             )
             .expect("the first draw");
@@ -2867,6 +2947,7 @@ fn opengl_overlapping_surfaces_resolve_each_other() {
                 map,
                 &output,
                 &textures,
+                &fragment,
                 &[screen_triangle],
             )
             .expect("the second draw");
@@ -3248,4 +3329,804 @@ fn opengl_evicted_surfaces_resolve_into_guest_memory() {
     );
     resolve(&mut resources, &mut gl, 0);
     assert_images_close(&cpu, &gl, &placed, 1, "the target after its eviction and return");
+}
+
+// ---------------------------------------------------------------------------
+// RGB8 targets
+// ---------------------------------------------------------------------------
+
+/// an RGB8 target draws like an RGBA8 one: the tiles pack 3 bytes a texel, the
+/// GL keeps them in an RGBA8 copy whose alpha stays at the 255 the format
+/// decodes, and what the GL holds resolves back into the guest's own bytes
+#[test]
+fn opengl_rgb8_targets_match_the_cpu() {
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    // a plain cover, then a slanted triangle over it
+    {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        registers[REG_COLOR_BUFFER_FORMAT] = 1 << 16; // RGB8
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        rasterize_shaded(
+            &registers,
+            &mut cpu,
+            &mut Resources::default(),
+            &cover(viewport, -0.5, FLAT),
+        );
+        rasterize_shaded(
+            &registers,
+            &mut gl,
+            &mut resources,
+            &cover(viewport, -0.5, FLAT),
+        );
+        let quad = slanted([OTHER, OTHER, OTHER], [1.2, 0.8, 1.0], -0.4);
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_rgb8_identical(&cpu, &gl, "RGB8 covers and a slanted triangle");
+    }
+    // a transparency blend over a base the draw never wrote, the alpha channel
+    // of the GL copy staying opaque while the blend reads it as the destination
+    {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut plain = registers(0);
+        plain[REG_COLOR_BUFFER_FORMAT] = 1 << 16;
+        plain[REG_BLEND_COLOR] = BLEND_CONSTANT;
+        let mut blended = plain.clone();
+        blended[REG_COLOR_OPERATION] = 0x100;
+        blended[REG_BLEND_FUNC] = blend_func((0, 6, 7), (0, 1, 0));
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        let base = cover(viewport, -0.5, FLAT);
+        rasterize_shaded(&plain, &mut cpu, &mut Resources::default(), &base);
+        rasterize_shaded(&plain, &mut gl, &mut resources, &base);
+        let quad = slanted([OTHER, OTHER, OTHER], [1.0, 1.0, 1.0], -0.4);
+        let placed = placed_triangles(&blended, &quad);
+        rasterize_shaded(&blended, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&blended, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_rgb8_close(&cpu, &gl, &placed, 1, "an RGB8 transparency blend");
+    }
+    // a partial color mask keeps the channels it may not change, over the same
+    // three bytes the format stores
+    {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut masked = registers(0);
+        masked[REG_COLOR_BUFFER_FORMAT] = 1 << 16;
+        masked[REG_DEPTH_COLOR_MASK] = 0x7 << 8; // red and green only
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        let base = cover(viewport, -0.5, FLAT);
+        rasterize_shaded(&registers(0), &mut cpu, &mut Resources::default(), &base);
+        rasterize_shaded(&registers(0), &mut gl, &mut resources, &base);
+        let quad = cover(viewport, -0.4, OTHER);
+        rasterize_shaded(&masked, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&masked, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_rgb8_identical(&cpu, &gl, "an RGB8 partial color mask");
+    }
+    // what the GL holds resolves into the guest's tiled RGB8 bytes, so a later
+    // draw reading the target as a texture sees the same texels both ways
+    {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        registers[REG_COLOR_BUFFER_FORMAT] = 1 << 16;
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        rasterize_shaded(
+            &registers,
+            &mut cpu,
+            &mut Resources::default(),
+            &cover(viewport, -0.5, FLAT),
+        );
+        rasterize_shaded(
+            &registers,
+            &mut gl,
+            &mut resources,
+            &cover(viewport, -0.5, FLAT),
+        );
+        registers[REG_TEXTURE_CONFIG] = 1;
+        registers[TEXTURE_UNIT_BASES[0] + 1] = 16 | (16 << 16);
+        registers[TEXTURE_UNIT_BASES[0] + 4] = COLOR >> 3;
+        registers[TEXTURE_UNIT_BASES[0] + 13] = 1; // RGB8
+        tev_stage(
+            &mut registers,
+            0,
+            [3, 0, 0],
+            [3, 0, 0],
+            [0; 3],
+            [0; 3],
+            0,
+            0,
+            0,
+        );
+        tev_passthrough(&mut registers, &[0]);
+        let quad = uv_quad(viewport, &[(&0, 0.0, 0.0, 1.0, 1.0)]);
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_rgb8_identical(&cpu, &gl, "sampling an RGB8 target as a texture");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fog
+// ---------------------------------------------------------------------------
+
+/// a factor of one falling to none across the fog table, one entry at a time
+fn fog_ramp() -> Vec<(u32, u32)> {
+    (0..128)
+        .map(|i| {
+            let factor = (127 - i) * 16;
+            (i, (factor << 13) | (0x2000 - 16))
+        })
+        .collect()
+}
+
+/// writes the entries into a run's fog table, the index register the way the
+/// table writes move it
+fn load_fog_table(registers: &mut [u32], table: &mut crate::fog::Table, entries: &[(u32, u32)]) {
+    for &(index, value) in entries {
+        registers[crate::fog::REG_TABLE_INDEX] = index;
+        table.write(registers, value);
+    }
+}
+
+/// a triangle whose depth slides across the target, so the fog's factor runs
+/// over its table instead of sitting at one entry
+fn depth_ramp() -> Vec<Vertex> {
+    let spots = [(2.0, 2.0), (14.0, 4.0), (4.0, 14.0)];
+    let zs = [-0.2f32, -0.5, -0.8];
+    let viewport = (0.0, 0.0, BUFFER as f32, BUFFER as f32);
+    spots
+        .into_iter()
+        .zip(zs)
+        .map(|(spot, z)| corner_at(viewport, spot.0, spot.1, z, 1.0, FLAT))
+        .collect()
+}
+
+/// the fog mixes into what the combiners made, by the fragment's depth thru its
+/// table and its color register, the alpha test having judged the fragment b4,
+/// and the alpha byte it leaves alone. The mix is one rounding step apart at
+/// most, the same slack the blends take.
+#[test]
+fn opengl_fog_matches_the_cpu() {
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    // no table ever written: a factor of none, the fog color everywhere
+    {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        registers[crate::fog::REG_MODE] = 5;
+        registers[crate::fog::REG_COLOR] = 0x00_80_40_20;
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        let quad = depth_ramp();
+        let placed = placed_triangles(&registers, &quad);
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_close(&cpu, &gl, &placed, 1, "an unread fog table");
+    }
+    // a ramp of factors, by a depth that slides across the triangle, and one
+    // flipped to read the table from the far end
+    for (name, flip, quad, table) in [
+        ("a fog ramp by depth", false, depth_ramp(), fog_ramp()),
+        (
+            "a flat quad at one depth",
+            false,
+            cover(viewport, -0.5, FLAT),
+            fog_ramp(),
+        ),
+        (
+            "a flipped fog reading from the far end",
+            true,
+            depth_ramp(),
+            fog_ramp(),
+        ),
+    ] {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        registers[crate::fog::REG_MODE] = 5 | ((flip as u32) << 16);
+        registers[crate::fog::REG_COLOR] = 0x00_80_40_20;
+        let mut cpu_resources = Resources::default();
+        load_fog_table(&mut registers, &mut cpu_resources.fog_table, &table);
+        load_fog_table(&mut registers, &mut resources.fog_table, &table);
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        let placed = placed_triangles(&registers, &quad);
+        rasterize_shaded(&registers, &mut cpu, &mut cpu_resources, &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_close(&cpu, &gl, &placed, 1, name);
+    }
+    // the alpha test judged the fragment b4 the fog mixed in, over a sliding
+    // alpha that splits on the reference, the fogged survivors matching
+    {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        registers[crate::fog::REG_MODE] = 5;
+        registers[crate::fog::REG_COLOR] = 0x00_80_40_20;
+        registers[REG_ALPHA_TEST] = 1 | (6 << 4) | (96 << 8); // greater than 96
+        let mut cpu_resources = Resources::default();
+        load_fog_table(&mut registers, &mut cpu_resources.fog_table, &fog_ramp());
+        load_fog_table(&mut registers, &mut resources.fog_table, &fog_ramp());
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        let quad = slanted(
+            [
+                [0.5, 0.25, 0.75, 0.35],
+                [0.5, 0.25, 0.75, 0.42],
+                [0.5, 0.25, 0.75, 0.7],
+            ],
+            [1.0, 1.0, 1.0],
+            -0.5,
+        );
+        let placed = placed_triangles(&registers, &quad);
+        rasterize_shaded(&registers, &mut cpu, &mut cpu_resources, &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_close(&cpu, &gl, &placed, 1, "a fog behind an alpha test");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fragment lighting
+// ---------------------------------------------------------------------------
+
+/// where the lighting registers sit, the addresses lighting.rs decodes them from
+const LIGHT_ENABLE: usize = 0x08F;
+const LIGHT_BLOCK: usize = 0x140; // sixteen words a light
+const LIGHT_GLOBAL_AMBIENT: usize = 0x1C0;
+const LIGHT_COUNT: usize = 0x1C2;
+const LIGHT_CONFIG0: usize = 0x1C3;
+const LIGHT_CONFIG1: usize = 0x1C4;
+const LIGHT_TABLE_INDEX: usize = 0x1C5;
+const LIGHT_TABLE_INPUT: usize = 0x1D1;
+const LIGHT_SLOTS: usize = 0x1D9;
+
+/// the words of a light's block, its spec colors, ambient and diffuse, its
+/// position and spot direction, its flags and its distance bias and scale
+const LIGHT_SPECULAR0: usize = LIGHT_BLOCK;
+const LIGHT_SPECULAR1: usize = LIGHT_BLOCK + 1;
+const LIGHT_DIFFUSE: usize = LIGHT_BLOCK + 2;
+const LIGHT_AMBIENT: usize = LIGHT_BLOCK + 3;
+const LIGHT_POSITION_XY: usize = LIGHT_BLOCK + 4;
+const LIGHT_POSITION_Z: usize = LIGHT_BLOCK + 5;
+const LIGHT_SPOT_XY: usize = LIGHT_BLOCK + 6;
+const LIGHT_SPOT_Z: usize = LIGHT_BLOCK + 7;
+const LIGHT_FLAGS: usize = LIGHT_BLOCK + 9;
+const LIGHT_DISTANCE_BIAS: usize = LIGHT_BLOCK + 10;
+const LIGHT_DISTANCE_SCALE: usize = LIGHT_BLOCK + 11;
+
+/// a light color of white, three 10 bit fields of 255
+const WHITE10: u32 = 0x3FFF_FFFF;
+
+/// a PICA float w/ a 12 bit mantissa and a 7 bit exponent, the light words'
+/// encoding, positive values only, the inverse of lighting's pica_float
+fn pica_float20(value: f32) -> u32 {
+    if value == 0.0 {
+        return 0;
+    }
+    let bits = value.to_bits();
+    let exponent = (((bits >> 23) & 0xFF) as i32 - 64) as u32;
+    ((exponent & 0x7F) << 12) | ((bits >> 11) & 0xFFF)
+}
+
+/// a PICA half, the position words' encoding, positive values only
+fn pica_half(value: f32) -> u32 {
+    if value == 0.0 {
+        return 0;
+    }
+    let bits = value.to_bits();
+    let exponent = (((bits >> 23) & 0xFF) as i32 - 112) as u32;
+    ((exponent & 0x1F) << 10) | ((bits >> 13) & 0x3FF)
+}
+
+/// a spotlight direction of -1 along z, a signed 1.11 fixed point
+const SPOT_BACKWARD: u32 = 0x2000 - 0x7FF;
+
+/// one lighting table entry, its value and the signed step to the next one
+fn table_entry(value: u32, step: i32) -> u32 {
+    let magnitude = step.unsigned_abs().min(2047);
+    (value & 0xFFF) | (magnitude << 12) | (u32::from(step < 0) << 23)
+}
+
+/// a table that climbs from none to nearly one across its entries
+fn rising_table(number: usize) -> Vec<(usize, u32)> {
+    (0..256)
+        .map(|i| (number, table_entry((i * 16) as u32, 16)))
+        .collect()
+}
+
+/// the same entries, entry for entry, into a run's tables
+fn load_lighting_tables(
+    registers: &mut [u32],
+    tables: &mut crate::lighting::Tables,
+    entries: &[(usize, u32)],
+) {
+    for &(number, value) in entries {
+        registers[LIGHT_TABLE_INDEX] = (number << 8) as u32;
+        tables.write(registers, value);
+    }
+}
+
+/// lights the first light for a case that reads none of its tables: the
+/// spotlight, the distance attenuation, both distributions, the fresnel and
+/// the reflections off, a directional light from +z in diffuse white
+fn plain_light(registers: &mut [u32]) {
+    registers[LIGHT_ENABLE] = 1;
+    registers[LIGHT_COUNT] = 0; // one light
+    registers[LIGHT_SLOTS] = 0; // slot 0 carries light 0
+    registers[LIGHT_CONFIG0] = 0; // config 0, no shadow, no bump
+    registers[LIGHT_CONFIG1] = (1 << 16)
+        | (1 << 17)
+        | (1 << 19)
+        | (1 << 20)
+        | (1 << 21)
+        | (1 << 22)
+        | (1 << 8)
+        | (1 << 24);
+    registers[LIGHT_SPECULAR0] = 0; // specular 0
+    registers[LIGHT_SPECULAR1] = 0; // specular 1
+    registers[LIGHT_DIFFUSE] = WHITE10; // diffuse
+    registers[LIGHT_AMBIENT] = 0; // ambient
+    registers[LIGHT_POSITION_XY] = 0; // position x and y at nothing
+    registers[LIGHT_POSITION_Z] = pica_half(1.0); // position z at one
+    registers[LIGHT_FLAGS] = 1; // directional
+}
+
+/// a triangle whose corners carry their own surface quaternion, view vector,
+/// weight and texture coordinates, so the lighting interpolates across it the
+/// way a wall of a title would
+#[allow(clippy::too_many_arguments)]
+fn lit_corners(
+    quaternions: [[f32; 4]; 3],
+    views: [[f32; 3]; 3],
+    ws: [f32; 3],
+    z_over_w: f32,
+    texcoords: [[[f32; 2]; 3]; 3],
+) -> Vec<Vertex> {
+    let spots = [(2.0f32, 2.0), (14.0, 4.0), (4.0, 14.0)];
+    let viewport = (0.0, 0.0, BUFFER as f32, BUFFER as f32);
+    spots
+        .into_iter()
+        .zip(quaternions)
+        .zip(views)
+        .zip(ws)
+        .zip(texcoords)
+        .map(|((((spot, quaternion), view), w), sets)| {
+            let mut vertex = corner_at(viewport, spot.0, spot.1, z_over_w, w, FLAT);
+            vertex.quaternion = quaternion;
+            vertex.view = view;
+            vertex.texcoords = sets;
+            vertex
+        })
+        .collect()
+}
+
+/// draws and compares one lighting case: the same registers, tables and
+/// texture bytes feed the CPU rasterizer and the GL's uber-shader, and the lit
+/// bytes come out a rounding step apart at most, the sums and dots the two
+/// sides evaluate in different orders wobbling the last step like the
+/// combiners already do
+fn run_lit(
+    resources: &mut Resources,
+    registers: &mut [u32],
+    cpu_tables: crate::lighting::Tables,
+    texels: Option<&[u8]>,
+    quad: &[Vertex],
+    name: &str,
+) {
+    let mut cpu_resources = Resources {
+        light_tables: cpu_tables,
+        ..Default::default()
+    };
+    let mut cpu = CountingMemory::zeroed(0x1_0000);
+    let mut gl = CountingMemory::zeroed(0x1_0000);
+    if let Some(texels) = texels {
+        lay_texture(&mut cpu, TEXTURE, texels, 0, 8, 8, 1);
+        lay_texture(&mut gl, TEXTURE, texels, 0, 8, 8, 1);
+    }
+    let placed = placed_triangles(registers, quad);
+    rasterize_shaded(registers, &mut cpu, &mut cpu_resources, quad);
+    rasterize_shaded(registers, &mut gl, resources, quad);
+    resolve(resources, &mut gl, 0);
+    assert_images_close(&cpu, &gl, &placed, 1, name);
+}
+
+/// a combiner handing one lighting color straight thru, the stages passing
+/// everything else on
+fn thru_stage(registers: &mut [u32], source: u32) {
+    tev_stage(
+        registers,
+        0,
+        [source, 0, 0],
+        [source, 0, 0],
+        [0; 3],
+        [0; 3],
+        0,
+        0,
+        0,
+    );
+    tev_passthrough(registers, &[0]);
+}
+
+/// every piece of the PICA's fragment lighting, a case at a time
+#[test]
+fn opengl_fragment_lighting_matches_the_cpu() {
+    let Some(mut resources) = opengl_resources() else {
+        return;
+    };
+    let quaternions = [
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.5, 0.0, 0.866_025_4],
+        [0.0, 0.866_025_4, 0.0, 0.5],
+    ];
+    // one corner's quaternion off the unit length, so the per fragment
+    // normalization has work to do
+    let uneven_quaternions = [
+        [0.0, 0.0, 0.0, 2.0],
+        [0.0, 0.5, 0.0, 0.866_025_4],
+        [0.0, 0.866_025_4, 0.0, 0.25],
+    ];
+    let views = [[0.0, 0.0, -2.0], [0.3, -0.2, -2.5], [-0.4, 0.5, -1.5]];
+    let ws = [1.0, 1.3, 0.8];
+    let no_texcoords = [[[0.0; 2]; 3]; 3];
+    // one span of coordinates over each of the three sets, for the cases that
+    // read a texture from any unit
+    let full_span = [[[0.0, 0.0]; 3], [[1.0, 0.0]; 3], [[0.0, 1.0]; 3]];
+    // the normal map's texels lean red and green about the middle, blue full
+    let normal_texels: Vec<u8> = (0..64)
+        .flat_map(|texel| {
+            [
+                96 + (texel * 37 % 64) as u8,
+                96 + (texel * 53 % 64) as u8,
+                255,
+                255,
+            ]
+        })
+        .collect();
+    // the shadow's texels run grey, some dim, some bright
+    let shadow_texels: Vec<u8> = (0..64)
+        .flat_map(|texel| {
+            let grey = 96 + (texel * 89 % 128) as u8;
+            [grey, grey, grey, 255]
+        })
+        .collect();
+
+    // a directional light's diffuse over a tilted surface, quaternions of
+    // uneven length normalized per fragment, the view vector interpolated
+    {
+        let mut registers = registers(0);
+        plain_light(&mut registers);
+        thru_stage(&mut registers, 1);
+        let quad = lit_corners(uneven_quaternions, views, ws, -0.5, no_texcoords);
+        run_lit(
+            &mut resources,
+            &mut registers,
+            crate::lighting::Tables::default(),
+            None,
+            &quad,
+            "a directional light's diffuse",
+        );
+    }
+    // a specular highlight off the half vector, its distribution table
+    {
+        let mut registers = registers(0);
+        plain_light(&mut registers);
+        registers[LIGHT_CONFIG1] &= !(1 << 16); // distribution 0 back on
+        registers[LIGHT_SPECULAR0] = WHITE10; // specular 0
+        thru_stage(&mut registers, 2);
+        let quad = lit_corners(quaternions, views, ws, -0.5, no_texcoords);
+        let mut tables = crate::lighting::Tables::default();
+        load_lighting_tables(&mut registers, &mut tables, &rising_table(0));
+        load_lighting_tables(
+            &mut registers,
+            &mut resources.light_tables,
+            &rising_table(0),
+        );
+        run_lit(
+            &mut resources,
+            &mut registers,
+            tables,
+            None,
+            &quad,
+            "a specular highlight off the half vector",
+        );
+    }
+    // a spotlight's cone around a positional light
+    {
+        let mut registers = registers(0);
+        plain_light(&mut registers);
+        registers[LIGHT_CONFIG1] &= !(1 << 8); // the spotlight back on
+        registers[LIGHT_FLAGS] = 0; // positional
+        registers[LIGHT_SPOT_XY] = 0; // spot direction x and y at nothing
+        registers[LIGHT_SPOT_Z] = SPOT_BACKWARD; // pointing away from the light
+        registers[LIGHT_TABLE_INPUT] = 4 << 8; // the light vector against the spot
+        thru_stage(&mut registers, 1);
+        let quad = lit_corners(quaternions, views, ws, -0.5, no_texcoords);
+        let mut tables = crate::lighting::Tables::default();
+        load_lighting_tables(&mut registers, &mut tables, &rising_table(8));
+        load_lighting_tables(
+            &mut registers,
+            &mut resources.light_tables,
+            &rising_table(8),
+        );
+        run_lit(
+            &mut resources,
+            &mut registers,
+            tables,
+            None,
+            &quad,
+            "a spotlight's cone",
+        );
+    }
+    // distance attenuation, the light sitting away from the surface so the
+    // place in its table slides with the view
+    {
+        let mut registers = registers(0);
+        plain_light(&mut registers);
+        registers[LIGHT_CONFIG1] &= !(1 << 24); // the distance back on
+        registers[LIGHT_FLAGS] = 0; // positional
+        registers[LIGHT_POSITION_XY] = 0;
+        registers[LIGHT_POSITION_Z] = pica_half(4.0); // sitting at (0, 0, 4)
+        registers[LIGHT_DISTANCE_BIAS] = pica_float20(0.25); // the bias
+        registers[LIGHT_DISTANCE_SCALE] = pica_float20(0.25); // the scale
+        thru_stage(&mut registers, 1);
+        let quad = lit_corners(quaternions, views, ws, -0.5, no_texcoords);
+        let mut tables = crate::lighting::Tables::default();
+        load_lighting_tables(&mut registers, &mut tables, &rising_table(16));
+        load_lighting_tables(
+            &mut registers,
+            &mut resources.light_tables,
+            &rising_table(16),
+        );
+        run_lit(
+            &mut resources,
+            &mut registers,
+            tables,
+            None,
+            &quad,
+            "a distance attenuation",
+        );
+    }
+    // the fresnel factor into the primary alpha
+    {
+        let mut registers = registers(0);
+        plain_light(&mut registers);
+        registers[LIGHT_CONFIG1] &= !(1 << 19); // the fresnel back on
+        registers[LIGHT_CONFIG0] = 1 << 2; // into the primary alpha
+        registers[LIGHT_TABLE_INPUT] = 2 << 12; // the normal against the view
+        thru_stage(&mut registers, 1);
+        let quad = lit_corners(quaternions, views, ws, -0.5, no_texcoords);
+        let mut tables = crate::lighting::Tables::default();
+        load_lighting_tables(&mut registers, &mut tables, &rising_table(3));
+        load_lighting_tables(
+            &mut registers,
+            &mut resources.light_tables,
+            &rising_table(3),
+        );
+        run_lit(
+            &mut resources,
+            &mut registers,
+            tables,
+            None,
+            &quad,
+            "a fresnel factor in the alpha",
+        );
+    }
+    // a global ambient the diffuse sums into, an ambient color on the light
+    {
+        let mut registers = registers(0);
+        plain_light(&mut registers);
+        registers[LIGHT_GLOBAL_AMBIENT] = WHITE10;
+        registers[LIGHT_AMBIENT] = WHITE10; // the light's own ambient
+        thru_stage(&mut registers, 1);
+        let quad = lit_corners(quaternions, views, ws, -0.5, no_texcoords);
+        run_lit(
+            &mut resources,
+            &mut registers,
+            crate::lighting::Tables::default(),
+            None,
+            &quad,
+            "ambient on the light and global",
+        );
+    }
+    // two sided lighting, the geometric factors and the clamped highlights,
+    // over a specular the distribution table drives
+    {
+        let mut registers = registers(0);
+        plain_light(&mut registers);
+        registers[LIGHT_CONFIG1] &= !(1 << 16); // distribution 0 back on
+        registers[LIGHT_CONFIG0] = 1 << 27; // clamp highlights
+        registers[LIGHT_SPECULAR0] = WHITE10; // specular 0
+        registers[LIGHT_SPECULAR1] = WHITE10; // specular 1
+        registers[LIGHT_FLAGS] = 0xE; // two sided, both geometric factors
+        thru_stage(&mut registers, 2);
+        let quad = lit_corners(quaternions, views, ws, -0.5, no_texcoords);
+        let mut tables = crate::lighting::Tables::default();
+        load_lighting_tables(&mut registers, &mut tables, &rising_table(0));
+        load_lighting_tables(
+            &mut registers,
+            &mut resources.light_tables,
+            &rising_table(0),
+        );
+        run_lit(
+            &mut resources,
+            &mut registers,
+            tables,
+            None,
+            &quad,
+            "two sided w/ geometric factors and clamped highlights",
+        );
+    }
+    // a shadow texture dimming the light's primary and secondary colors
+    {
+        let mut registers = registers(0);
+        plain_light(&mut registers);
+        registers[LIGHT_CONFIG1] &= !(1 << 16); // distribution 0 back on
+        registers[LIGHT_CONFIG0] = 1 // shadow on
+            | (2 << 24) // reading unit 2
+            | (1 << 16) // over the primary
+            | (1 << 17); // and the secondary
+        registers[LIGHT_SPECULAR0] = WHITE10; // specular 0
+        bind_texture_unit(&mut registers, 2, TEXTURE, 8, 8, 0, 0, 0);
+        thru_stage(&mut registers, 1);
+        let quad = lit_corners(quaternions, views, ws, -0.5, full_span);
+        run_lit(
+            &mut resources,
+            &mut registers,
+            crate::lighting::Tables::default(),
+            Some(&shadow_texels),
+            &quad,
+            "a shadow texture on the light",
+        );
+    }
+    // a bump map's normals, rebuilt toward z, lighting the surface
+    {
+        let mut registers = registers(0);
+        plain_light(&mut registers);
+        registers[LIGHT_CONFIG0] = 1 << 28; // bump normals off unit 0, rebuilt
+        bind_texture_unit(&mut registers, 0, TEXTURE, 8, 8, 0, 0, 0);
+        thru_stage(&mut registers, 1);
+        let quad = lit_corners(quaternions, views, ws, -0.5, full_span);
+        run_lit(
+            &mut resources,
+            &mut registers,
+            crate::lighting::Tables::default(),
+            Some(&normal_texels),
+            &quad,
+            "a bump map's normals",
+        );
+    }
+    // the last configuration's tables, reading the half vector, the view and
+    // the tangent a bump map carries, into the specular colors. The light sits
+    // off the view axis: a light straight against the view makes a half vector
+    // of nearly nothing, whose direction is rounding noise.
+    {
+        let mut registers = registers(0);
+        plain_light(&mut registers);
+        registers[LIGHT_CONFIG0] = (8 << 4) // config 8
+            | (2 << 28) // bump tangents
+            | (1 << 22); // off unit 1
+        registers[LIGHT_CONFIG1] &= !((1 << 16) | (1 << 17) | (1 << 20) | (1 << 21) | (1 << 22));
+        registers[LIGHT_SPECULAR0] = WHITE10; // specular 0
+        registers[LIGHT_SPECULAR1] = WHITE10; // specular 1
+        registers[LIGHT_POSITION_XY] = pica_half(1.0); // sitting at (1, 0, 1)
+                                                       // the tangent, the half vector, the view and the normal to the tables
+        registers[LIGHT_TABLE_INPUT] = 5 | (1 << 20) | (2 << 24);
+        bind_texture_unit(&mut registers, 1, TEXTURE, 8, 8, 0, 0, 0);
+        thru_stage(&mut registers, 2);
+        let quad = lit_corners(quaternions, views, ws, -0.5, full_span);
+        let mut tables = crate::lighting::Tables::default();
+        let entries = rising_table(0)
+            .into_iter()
+            .chain(rising_table(1))
+            .chain(rising_table(4))
+            .chain(rising_table(5))
+            .chain(rising_table(6))
+            .collect::<Vec<_>>();
+        load_lighting_tables(&mut registers, &mut tables, &entries);
+        load_lighting_tables(&mut registers, &mut resources.light_tables, &entries);
+        run_lit(
+            &mut resources,
+            &mut registers,
+            tables,
+            Some(&normal_texels),
+            &quad,
+            "the tangent tables of the last configuration",
+        );
+    }
+    // the tables a rewrite between draws reaches the GL thru: the distribution
+    // climbs, then falls, and the second answer follows the new entries
+    {
+        let mut registers = registers(0);
+        plain_light(&mut registers);
+        registers[LIGHT_CONFIG1] &= !(1 << 16); // distribution 0 back on
+        registers[LIGHT_SPECULAR0] = WHITE10; // specular 0
+        thru_stage(&mut registers, 2);
+        let quad = lit_corners(quaternions, views, ws, -0.5, no_texcoords);
+        let falling: Vec<(usize, u32)> = (0..256)
+            .map(|i| (0, table_entry(((255 - i) * 16) as u32, -16)))
+            .collect();
+        let mut tables = crate::lighting::Tables::default();
+        load_lighting_tables(&mut registers, &mut tables, &rising_table(0));
+        load_lighting_tables(
+            &mut registers,
+            &mut resources.light_tables,
+            &rising_table(0),
+        );
+        run_lit(
+            &mut resources,
+            &mut registers,
+            tables,
+            None,
+            &quad,
+            "a distribution that climbs",
+        );
+        let mut tables = crate::lighting::Tables::default();
+        load_lighting_tables(&mut registers, &mut tables, &falling);
+        load_lighting_tables(&mut registers, &mut resources.light_tables, &falling);
+        run_lit(
+            &mut resources,
+            &mut registers,
+            tables,
+            None,
+            &quad,
+            "the same distribution rewritten to fall",
+        );
+    }
+    // the lighting off, then on again over the same registers: a draw with no
+    // lighting answers the combiner's lighting colors defensively, and the
+    // next one lights for real
+    {
+        let mut registers = registers(0);
+        plain_light(&mut registers);
+        registers[LIGHT_CONFIG1] &= !(1 << 16); // distribution 0 back on
+        registers[LIGHT_SPECULAR0] = WHITE10; // specular 0
+        thru_stage(&mut registers, 2);
+        let quad = lit_corners(quaternions, views, ws, -0.5, no_texcoords);
+        let mut tables = crate::lighting::Tables::default();
+        load_lighting_tables(&mut registers, &mut tables, &rising_table(0));
+        load_lighting_tables(
+            &mut registers,
+            &mut resources.light_tables,
+            &rising_table(0),
+        );
+        registers[LIGHT_ENABLE] = 0;
+        run_lit(
+            &mut resources,
+            &mut registers,
+            tables,
+            None,
+            &quad,
+            "the lighting switched off",
+        );
+        registers[LIGHT_ENABLE] = 1;
+        let mut tables = crate::lighting::Tables::default();
+        load_lighting_tables(&mut registers, &mut tables, &rising_table(0));
+        run_lit(
+            &mut resources,
+            &mut registers,
+            tables,
+            None,
+            &quad,
+            "the lighting switched back on",
+        );
+    }
 }

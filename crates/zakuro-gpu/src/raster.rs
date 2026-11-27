@@ -3261,12 +3261,18 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         if let Some(output) = output {
             // the texture units as the uber-shader takes them, and the combiners
             let texture_setup = gl_texture_setup(&state);
+            // the fragment stages the uber-shader runs past the units: fragment
+            // lighting with all its lights, tables and bump and shadow reads,
+            // and the fog. Procedural textures stay on the CPU.
+            let fragment = opengl::FragmentSetup {
+                lighting: state.lighting,
+                tables: state.tables,
+                fog: state.fog.as_ref(),
+            };
             let supported = state.target.buffer_width.is_multiple_of(8)
                 && state.target.buffer_height.is_multiple_of(8)
-                && state.target.format == ColorFormat::Rgba8
+                && matches!(state.target.format, ColorFormat::Rgba8 | ColorFormat::Rgb8)
                 && state.proctex.is_none()
-                && state.lighting.is_none()
-                && state.fog.is_none()
                 && texture_setup.is_some()
                 && state.depth_stencil.as_ref().map_or(true, |depth| {
                     let color_end = state.target.addr.saturating_add(
@@ -3274,7 +3280,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                             .target
                             .buffer_width
                             .saturating_mul(state.target.buffer_height)
-                            .saturating_mul(4),
+                            .saturating_mul(state.target.format.bytes_per_pixel() as u32),
                     );
                     let depth_end = depth.addr.saturating_add(
                         state
@@ -3295,6 +3301,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                     state.depth_map,
                     &output,
                     &texture_setup,
+                    &fragment,
                     &triangles,
                 ) {
                     Ok(()) => return Some(triangle_count as u32),
@@ -4724,18 +4731,24 @@ mod tests {
             })
             .collect();
         // the rows past the buffer, whatever memory holds there
-        let past: Vec<u8> = (0..SIZE * SIZE / 2 * 4).map(|_| (random() * 256.0) as u8).collect();
-        let quad: Vec<Vertex> = [[-1.0, -1.0, 0.0, 0.0], [3.0, -1.0, 2.0, 0.0], [-1.0, 3.0, 0.0, 2.0]]
-            .into_iter()
-            .map(|[x, y, u, v]| Vertex {
-                clip: [x, y, -0.5, 1.0],
-                color: [1.0; 4],
-                texcoords: [[u, v], [0.0; 2], [0.0; 2]],
-                quaternion: [0.0, 0.0, 0.0, 1.0],
-                view: [0.0; 3],
-                texcoord0_w: 1.0,
-            })
+        let past: Vec<u8> = (0..SIZE * SIZE / 2 * 4)
+            .map(|_| (random() * 256.0) as u8)
             .collect();
+        let quad: Vec<Vertex> = [
+            [-1.0, -1.0, 0.0, 0.0],
+            [3.0, -1.0, 2.0, 0.0],
+            [-1.0, 3.0, 0.0, 2.0],
+        ]
+        .into_iter()
+        .map(|[x, y, u, v]| Vertex {
+            clip: [x, y, -0.5, 1.0],
+            color: [1.0; 4],
+            texcoords: [[u, v], [0.0; 2], [0.0; 2]],
+            quaternion: [0.0, 0.0, 0.0, 1.0],
+            view: [0.0; 3],
+            texcoord0_w: 1.0,
+        })
+        .collect();
 
         let mut results = Vec::new();
         for (hardware, back_first) in [(first, false), (second, true)] {

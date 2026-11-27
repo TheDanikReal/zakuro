@@ -7,7 +7,7 @@ use super::{ColorTarget, DepthMap, DepthStencil, Screen};
 use crate::{GpuMemory, format::morton_offset};
 
 const VERTEX_SHADER: &str = r#"#version 330 core
-layout(location = 0) in vec2 position_over_w;
+layout(location = 0) in vec2 position_times_w;
 layout(location = 1) in float inverse_w;
 layout(location = 2) in vec4 color;
 layout(location = 3) in float depth_z;
@@ -15,7 +15,7 @@ out vec4 vertex_color;
  noperspective out float pica_depth;
  noperspective out float pica_inverse_w;
 void main() {
-    gl_Position = vec4(position_over_w, 0.0, inverse_w);
+    gl_Position = vec4(position_times_w, 0.0, 1.0 / inverse_w);
     vertex_color = color;
     pica_depth = depth_z;
     pica_inverse_w = inverse_w;
@@ -38,6 +38,8 @@ void main() {
 }
 "#;
 
+const SURFACE_CACHE_BUDGET: u64 = 128 * 1024 * 1024;
+
 /// OpenGL resources are created and used on the thread where the context is current.
 pub(crate) struct OpenGlRasterizer {
     gl: std::sync::Arc<glow::Context>,
@@ -45,6 +47,8 @@ pub(crate) struct OpenGlRasterizer {
     vertex_array: glow::VertexArray,
     vertices: glow::Buffer,
     surfaces: HashMap<SurfaceKey, Surface>,
+    surface_bytes: u64,
+    surface_clock: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -64,6 +68,8 @@ struct Surface {
     initialized: bool,
     dirty: bool,
     depth_dirty: bool,
+    storage_bytes: u64,
+    last_used: u64,
 }
 
 impl OpenGlRasterizer {
@@ -78,10 +84,21 @@ impl OpenGlRasterizer {
 
         unsafe {
             let program = link_program(&gl)?;
-            let vertex_array = gl
-                .create_vertex_array()
-                .map_err(|error| error.to_string())?;
-            let vertices = gl.create_buffer().map_err(|error| error.to_string())?;
+            let vertex_array = match gl.create_vertex_array() {
+                Ok(vertex_array) => vertex_array,
+                Err(error) => {
+                    gl.delete_program(program);
+                    return Err(error.to_string());
+                }
+            };
+            let vertices = match gl.create_buffer() {
+                Ok(vertices) => vertices,
+                Err(error) => {
+                    gl.delete_vertex_array(vertex_array);
+                    gl.delete_program(program);
+                    return Err(error.to_string());
+                }
+            };
 
             gl.bind_vertex_array(Some(vertex_array));
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertices));
@@ -123,6 +140,8 @@ impl OpenGlRasterizer {
                 vertex_array,
                 vertices,
                 surfaces: HashMap::new(),
+                surface_bytes: 0,
+                surface_clock: 0,
             })
         }
     }
@@ -135,7 +154,7 @@ impl OpenGlRasterizer {
         depth_map: DepthMap,
         triangles: &[[Screen; 3]],
     ) -> Result<(), String> {
-        if triangles.is_empty() {
+        if triangles.is_empty() || target.right <= target.left || target.top <= target.bottom {
             return Ok(());
         }
         let (width, height) = (target.buffer_width, target.buffer_height);
@@ -153,6 +172,7 @@ impl OpenGlRasterizer {
             depth_bytes: depth.map_or(0, |d| d.bytes),
         };
         let cached = self.surfaces.contains_key(&key);
+        let storage_bytes = surface_storage_bytes(width, height, key.depth_bytes);
         if cached {
             self.sync_except(memory, target.addr, pixels as u32, true, Some(key));
             if let Some(depth) = depth {
@@ -165,6 +185,7 @@ impl OpenGlRasterizer {
                 );
             }
         } else {
+            self.evict_to_budget(memory, storage_bytes);
             self.sync(memory, target.addr, pixels as u32, true);
             if let Some(depth) = depth {
                 self.sync(
@@ -176,99 +197,9 @@ impl OpenGlRasterizer {
             }
         }
         if !self.surfaces.contains_key(&key) {
-            let (framebuffer, color, depth_texture) = unsafe {
-                let framebuffer = self.gl.create_framebuffer().map_err(|e| e.to_string())?;
-                let color = self.gl.create_texture().map_err(|e| e.to_string())?;
-                self.gl.bind_texture(glow::TEXTURE_2D, Some(color));
-                self.gl.tex_parameter_i32(
-                    glow::TEXTURE_2D,
-                    glow::TEXTURE_MIN_FILTER,
-                    glow::NEAREST as i32,
-                );
-                self.gl.tex_parameter_i32(
-                    glow::TEXTURE_2D,
-                    glow::TEXTURE_MAG_FILTER,
-                    glow::NEAREST as i32,
-                );
-                self.gl.tex_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    glow::RGBA8 as i32,
-                    width as i32,
-                    height as i32,
-                    0,
-                    glow::RGBA,
-                    glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::Slice(None),
-                );
-                self.gl
-                    .bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
-                self.gl.framebuffer_texture_2d(
-                    glow::FRAMEBUFFER,
-                    glow::COLOR_ATTACHMENT0,
-                    glow::TEXTURE_2D,
-                    Some(color),
-                    0,
-                );
-                let depth_texture = if key.depth_bytes != 0 {
-                    let texture = self.gl.create_texture().map_err(|e| e.to_string())?;
-                    self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                    self.gl.tex_parameter_i32(
-                        glow::TEXTURE_2D,
-                        glow::TEXTURE_MIN_FILTER,
-                        glow::NEAREST as i32,
-                    );
-                    self.gl.tex_parameter_i32(
-                        glow::TEXTURE_2D,
-                        glow::TEXTURE_MAG_FILTER,
-                        glow::NEAREST as i32,
-                    );
-                    let internal = if key.depth_bytes == 2 {
-                        glow::DEPTH_COMPONENT16
-                    } else if key.depth_bytes == 4 {
-                        glow::DEPTH24_STENCIL8
-                    } else {
-                        glow::DEPTH_COMPONENT24
-                    };
-                    self.gl.tex_image_2d(
-                        glow::TEXTURE_2D,
-                        0,
-                        internal as i32,
-                        width as i32,
-                        height as i32,
-                        0,
-                        if key.depth_bytes == 4 {
-                            glow::DEPTH_STENCIL
-                        } else {
-                            glow::DEPTH_COMPONENT
-                        },
-                        if key.depth_bytes == 2 {
-                            glow::UNSIGNED_SHORT
-                        } else if key.depth_bytes == 4 {
-                            glow::UNSIGNED_INT_24_8
-                        } else {
-                            glow::FLOAT
-                        },
-                        glow::PixelUnpackData::Slice(None),
-                    );
-                    self.gl.framebuffer_texture_2d(
-                        glow::FRAMEBUFFER,
-                        if key.depth_bytes == 4 {
-                            glow::DEPTH_STENCIL_ATTACHMENT
-                        } else {
-                            glow::DEPTH_ATTACHMENT
-                        },
-                        glow::TEXTURE_2D,
-                        Some(texture),
-                        0,
-                    );
-                    Some(texture)
-                } else {
-                    None
-                };
-                self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                (framebuffer, color, depth_texture)
-            };
+            let (framebuffer, color, depth_texture) =
+                unsafe { create_surface(&self.gl, width, height, key.depth_bytes)? };
+            self.surface_clock = self.surface_clock.wrapping_add(1);
             self.surfaces.insert(
                 key,
                 Surface {
@@ -278,18 +209,31 @@ impl OpenGlRasterizer {
                     initialized: false,
                     dirty: false,
                     depth_dirty: false,
+                    storage_bytes,
+                    last_used: self.surface_clock,
                 },
             );
+            self.surface_bytes = self.surface_bytes.saturating_add(storage_bytes);
         }
-        let surface = self.surfaces.get_mut(&key).unwrap();
+        self.surface_clock = self.surface_clock.wrapping_add(1);
+        let (framebuffer, color, depth_texture, initialized) = {
+            let surface = self.surfaces.get_mut(&key).unwrap();
+            surface.last_used = self.surface_clock;
+            (
+                surface.framebuffer,
+                surface.color,
+                surface.depth,
+                surface.initialized,
+            )
+        };
         let mut tiled = vec![0; pixels];
-        let linear = if surface.initialized {
+        let linear = if initialized {
             Vec::new()
         } else {
             memory.read(target.addr, &mut tiled);
             tiled_to_linear(&tiled, width, height)
         };
-        let depth_linear = if !surface.initialized && key.depth_bytes != 0 {
+        let depth_linear = if !initialized && key.depth_bytes != 0 {
             let mut depth_tiled = vec![0; (width * height * key.depth_bytes) as usize];
             memory.read(key.depth_addr, &mut depth_tiled);
             Some(depth_to_linear(
@@ -307,8 +251,8 @@ impl OpenGlRasterizer {
             for vertex in triangle {
                 let inverse_w = vertex.inv_w;
                 vertices.extend([
-                    (2.0 * vertex.x / width as f32 - 1.0) * inverse_w,
-                    (2.0 * vertex.y / height as f32 - 1.0) * inverse_w,
+                    (2.0 * vertex.x / width as f32 - 1.0) / inverse_w,
+                    (2.0 * vertex.y / height as f32 - 1.0) / inverse_w,
                     inverse_w,
                 ]);
                 vertices.extend(vertex.color_over_w.map(|component| component / inverse_w));
@@ -317,12 +261,12 @@ impl OpenGlRasterizer {
         }
         let vertex_bytes = bytemuck::cast_slice(&vertices);
 
-        unsafe {
+        let framebuffer_complete = unsafe {
             let gl = &self.gl;
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
             gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
-            gl.bind_texture(glow::TEXTURE_2D, Some(surface.color));
-            if !surface.initialized {
+            gl.bind_texture(glow::TEXTURE_2D, Some(color));
+            if !initialized {
                 gl.tex_sub_image_2d(
                     glow::TEXTURE_2D,
                     0,
@@ -335,7 +279,7 @@ impl OpenGlRasterizer {
                     glow::PixelUnpackData::Slice(Some(&linear)),
                 );
                 if let (Some(depth_texture), Some(depth_data)) =
-                    (surface.depth, depth_linear.as_ref())
+                    (depth_texture, depth_linear.as_ref())
                 {
                     gl.bind_texture(glow::TEXTURE_2D, Some(depth_texture));
                     gl.tex_sub_image_2d(
@@ -362,87 +306,134 @@ impl OpenGlRasterizer {
                 }
             }
 
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(surface.framebuffer));
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
             if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                return Err("OpenGL framebuffer is incomplete".to_owned());
-            }
-            gl.viewport(0, 0, width as i32, height as i32);
-            gl.enable(glow::SCISSOR_TEST);
-            gl.scissor(
-                target.left,
-                target.bottom,
-                target.right.saturating_sub(target.left),
-                target.top.saturating_sub(target.bottom),
-            );
-            gl.disable(glow::BLEND);
-            if let Some(depth_state) = depth {
-                gl.enable(glow::DEPTH_TEST);
-                gl.depth_func(depth_state.test.map_or(glow::ALWAYS, compare));
-                gl.depth_mask(depth_state.write_depth);
-                if let Some(stencil) = depth_state.stencil {
-                    gl.enable(glow::STENCIL_TEST);
-                    gl.stencil_func(
-                        compare(stencil.function),
-                        stencil.reference as i32,
-                        stencil.compare_mask as u32,
-                    );
-                    gl.stencil_mask(if depth_state.write_stencil {
-                        stencil.write_mask as u32
+                false
+            } else {
+                gl.viewport(0, 0, width as i32, height as i32);
+                gl.enable(glow::SCISSOR_TEST);
+                gl.scissor(
+                    target.left,
+                    target.bottom,
+                    target.right.saturating_sub(target.left),
+                    target.top.saturating_sub(target.bottom),
+                );
+                gl.disable(glow::BLEND);
+                if let Some(depth_state) = depth {
+                    gl.enable(glow::DEPTH_TEST);
+                    gl.depth_func(depth_state.test.map_or(glow::ALWAYS, compare));
+                    gl.depth_mask(depth_state.write_depth);
+                    if let Some(stencil) = depth_state.stencil {
+                        gl.enable(glow::STENCIL_TEST);
+                        gl.stencil_func(
+                            compare(stencil.function),
+                            stencil.reference as i32,
+                            stencil.compare_mask as u32,
+                        );
+                        gl.stencil_mask(if depth_state.write_stencil {
+                            stencil.write_mask as u32
+                        } else {
+                            0
+                        });
+                        gl.stencil_op(
+                            stencil_op(stencil.fail),
+                            stencil_op(stencil.depth_fail),
+                            stencil_op(stencil.pass),
+                        );
                     } else {
-                        0
-                    });
-                    gl.stencil_op(
-                        stencil_op(stencil.fail),
-                        stencil_op(stencil.depth_fail),
-                        stencil_op(stencil.pass),
-                    );
+                        gl.disable(glow::STENCIL_TEST);
+                    }
                 } else {
+                    gl.disable(glow::DEPTH_TEST);
                     gl.disable(glow::STENCIL_TEST);
                 }
-            } else {
+                gl.disable(glow::CULL_FACE);
+                gl.disable(glow::DITHER);
+                gl.disable(glow::FRAMEBUFFER_SRGB);
+                gl.color_mask(true, true, true, true);
+                gl.use_program(Some(self.program));
+                gl.bind_vertex_array(Some(self.vertex_array));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vertices));
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, vertex_bytes, glow::STREAM_DRAW);
+                if let Some(location) = gl.get_uniform_location(self.program, "depth_scale") {
+                    gl.uniform_1_f32(Some(&location), depth_map.scale);
+                }
+                if let Some(location) = gl.get_uniform_location(self.program, "depth_offset") {
+                    gl.uniform_1_f32(Some(&location), depth_map.offset);
+                }
+                if let Some(location) = gl.get_uniform_location(self.program, "w_buffer") {
+                    gl.uniform_1_i32(Some(&location), depth_map.w_buffer as i32);
+                }
+                gl.draw_arrays(glow::TRIANGLES, 0, (vertices.len() / 8) as i32);
+                gl.bind_vertex_array(None);
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                gl.disable(glow::SCISSOR_TEST);
                 gl.disable(glow::DEPTH_TEST);
                 gl.disable(glow::STENCIL_TEST);
+                gl.disable(glow::BLEND);
+                gl.depth_mask(true);
+                gl.stencil_mask(0xFF);
+                gl.color_mask(true, true, true, true);
+                true
             }
-            gl.disable(glow::CULL_FACE);
-            gl.disable(glow::DITHER);
-            gl.disable(glow::FRAMEBUFFER_SRGB);
-            gl.color_mask(true, true, true, true);
-            gl.use_program(Some(self.program));
-            gl.bind_vertex_array(Some(self.vertex_array));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vertices));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, vertex_bytes, glow::STREAM_DRAW);
-            if let Some(location) = gl.get_uniform_location(self.program, "depth_scale") {
-                gl.uniform_1_f32(Some(&location), depth_map.scale);
-            }
-            if let Some(location) = gl.get_uniform_location(self.program, "depth_offset") {
-                gl.uniform_1_f32(Some(&location), depth_map.offset);
-            }
-            if let Some(location) = gl.get_uniform_location(self.program, "w_buffer") {
-                gl.uniform_1_i32(Some(&location), depth_map.w_buffer as i32);
-            }
-            gl.draw_arrays(glow::TRIANGLES, 0, (vertices.len() / 8) as i32);
-            gl.bind_vertex_array(None);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.disable(glow::DEPTH_TEST);
-            gl.disable(glow::STENCIL_TEST);
-            gl.disable(glow::BLEND);
-            gl.depth_mask(true);
-            gl.stencil_mask(0xFF);
-            gl.color_mask(true, true, true, true);
+        };
+        if !framebuffer_complete {
+            self.evict_to_budget(memory, 0);
+            return Err("OpenGL framebuffer is incomplete".to_owned());
         }
+        let surface = self.surfaces.get_mut(&key).unwrap();
         surface.initialized = true;
         surface.dirty = true;
         surface.depth_dirty |= depth.is_some_and(|d| d.write_depth || d.write_stencil);
         memory.guard(target.addr, (width * height * 4) as u32);
         memory.guard_writes(target.addr, (width * height * 4) as u32);
-        if let Some(depth) = depth.filter(|d| d.write_depth || d.write_stencil) {
+        if let Some(depth) = depth {
             let bytes = width.saturating_mul(height).saturating_mul(depth.bytes);
             memory.guard(depth.addr, bytes);
             memory.guard_writes(depth.addr, bytes);
         }
+        self.evict_to_budget(memory, 0);
         Ok(())
+    }
+
+    /// Drop cached targets without resolving their contents into guest memory.
+    pub(crate) fn reset(&mut self) {
+        for (_, surface) in self.surfaces.drain() {
+            unsafe {
+                delete_surface(&self.gl, surface);
+            }
+        }
+        self.surface_bytes = 0;
+    }
+
+    fn evict_to_budget<M: GpuMemory>(&mut self, memory: &mut M, incoming_bytes: u64) {
+        let limit = SURFACE_CACHE_BUDGET.saturating_sub(incoming_bytes);
+        while self.surface_bytes > limit {
+            let Some(key) = self
+                .surfaces
+                .iter()
+                .min_by_key(|(_, surface)| surface.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            let color_bytes = key.width.saturating_mul(key.height).saturating_mul(4);
+            self.sync(memory, key.addr, color_bytes, false);
+            if key.depth_bytes != 0 {
+                let depth_bytes = key
+                    .width
+                    .saturating_mul(key.height)
+                    .saturating_mul(key.depth_bytes);
+                self.sync(memory, key.depth_addr, depth_bytes, false);
+            }
+            if let Some(surface) = self.surfaces.remove(&key) {
+                self.surface_bytes = self.surface_bytes.saturating_sub(surface.storage_bytes);
+                unsafe {
+                    delete_surface(&self.gl, surface);
+                }
+            }
+        }
     }
 
     /// Resolve GPU-new pixels only when guest memory is about to be observed or overwritten.
@@ -580,32 +571,188 @@ impl OpenGlRasterizer {
     }
 }
 
+fn surface_storage_bytes(width: u32, height: u32, depth_bytes: u32) -> u64 {
+    let depth_storage = match depth_bytes {
+        0 => 0,
+        2 => 2,
+        _ => 4,
+    };
+    u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4 + depth_storage)
+}
+
+unsafe fn create_surface(
+    gl: &glow::Context,
+    width: u32,
+    height: u32,
+    depth_bytes: u32,
+) -> Result<(glow::Framebuffer, glow::Texture, Option<glow::Texture>), String> {
+    unsafe {
+        let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
+        let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
+        let mut framebuffer = None;
+        let mut color = None;
+        let mut depth = None;
+        let result = (|| {
+            let made_framebuffer = gl.create_framebuffer().map_err(|e| e.to_string())?;
+            framebuffer = Some(made_framebuffer);
+            let made_color = gl.create_texture().map_err(|e| e.to_string())?;
+            color = Some(made_color);
+            gl.bind_texture(glow::TEXTURE_2D, Some(made_color));
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                width as i32,
+                height as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(made_framebuffer));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(made_color),
+                0,
+            );
+            if depth_bytes != 0 {
+                let made_depth = gl.create_texture().map_err(|e| e.to_string())?;
+                depth = Some(made_depth);
+                gl.bind_texture(glow::TEXTURE_2D, Some(made_depth));
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MIN_FILTER,
+                    glow::NEAREST as i32,
+                );
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MAG_FILTER,
+                    glow::NEAREST as i32,
+                );
+                let internal = if depth_bytes == 2 {
+                    glow::DEPTH_COMPONENT16
+                } else if depth_bytes == 4 {
+                    glow::DEPTH24_STENCIL8
+                } else {
+                    glow::DEPTH_COMPONENT24
+                };
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    internal as i32,
+                    width as i32,
+                    height as i32,
+                    0,
+                    if depth_bytes == 4 {
+                        glow::DEPTH_STENCIL
+                    } else {
+                        glow::DEPTH_COMPONENT
+                    },
+                    if depth_bytes == 2 {
+                        glow::UNSIGNED_SHORT
+                    } else if depth_bytes == 4 {
+                        glow::UNSIGNED_INT_24_8
+                    } else {
+                        glow::FLOAT
+                    },
+                    glow::PixelUnpackData::Slice(None),
+                );
+                gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    if depth_bytes == 4 {
+                        glow::DEPTH_STENCIL_ATTACHMENT
+                    } else {
+                        glow::DEPTH_ATTACHMENT
+                    },
+                    glow::TEXTURE_2D,
+                    Some(made_depth),
+                    0,
+                );
+            }
+            Ok(())
+        })();
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, previous_draw);
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, previous_read);
+        if let Err(error) = result {
+            if let Some(framebuffer) = framebuffer {
+                gl.delete_framebuffer(framebuffer);
+            }
+            if let Some(color) = color {
+                gl.delete_texture(color);
+            }
+            if let Some(depth) = depth {
+                gl.delete_texture(depth);
+            }
+            return Err(error);
+        }
+        Ok((
+            framebuffer.expect("created framebuffer"),
+            color.expect("created color texture"),
+            depth,
+        ))
+    }
+}
+
+unsafe fn delete_surface(gl: &glow::Context, surface: Surface) {
+    unsafe {
+        gl.delete_framebuffer(surface.framebuffer);
+        gl.delete_texture(surface.color);
+        if let Some(depth) = surface.depth {
+            gl.delete_texture(depth);
+        }
+    }
+}
+
 unsafe fn link_program(gl: &glow::Context) -> Result<glow::Program, String> {
     unsafe {
         let program = gl.create_program().map_err(|error| error.to_string())?;
-        let mut shaders = Vec::new();
-        for (kind, source) in [
-            (glow::VERTEX_SHADER, VERTEX_SHADER),
-            (glow::FRAGMENT_SHADER, FRAGMENT_SHADER),
-        ] {
-            let shader = gl.create_shader(kind).map_err(|error| error.to_string())?;
-            gl.shader_source(shader, source);
-            gl.compile_shader(shader);
-            if !gl.get_shader_compile_status(shader) {
+        let mut shaders = Vec::with_capacity(2);
+        let result = (|| {
+            for (kind, source) in [
+                (glow::VERTEX_SHADER, VERTEX_SHADER),
+                (glow::FRAGMENT_SHADER, FRAGMENT_SHADER),
+            ] {
+                let shader = gl.create_shader(kind).map_err(|error| error.to_string())?;
+                shaders.push(shader);
+                gl.shader_source(shader, source);
+                gl.compile_shader(shader);
+                if !gl.get_shader_compile_status(shader) {
+                    return Err(format!(
+                        "OpenGL shader failed to compile: {}",
+                        gl.get_shader_info_log(shader)
+                    ));
+                }
+                gl.attach_shader(program, shader);
+            }
+            gl.link_program(program);
+            if !gl.get_program_link_status(program) {
                 return Err(format!(
-                    "OpenGL shader failed to compile: {}",
-                    gl.get_shader_info_log(shader)
+                    "OpenGL program failed to link: {}",
+                    gl.get_program_info_log(program)
                 ));
             }
-            gl.attach_shader(program, shader);
-            shaders.push(shader);
-        }
-        gl.link_program(program);
-        if !gl.get_program_link_status(program) {
-            return Err(format!(
-                "OpenGL program failed to link: {}",
-                gl.get_program_info_log(program)
-            ));
+            Ok(())
+        })();
+        if let Err(error) = result {
+            gl.delete_program(program);
+            for shader in shaders {
+                gl.delete_shader(shader);
+            }
+            return Err(error);
         }
         for shader in shaders {
             gl.detach_shader(program, shader);

@@ -1490,6 +1490,10 @@ impl Resources {
                 hardware.forget();
             }
         }
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.opengl.as_mut() {
+            renderer.reset();
+        }
     }
 
     /// what the next draws do for frame interpolation

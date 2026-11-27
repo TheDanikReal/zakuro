@@ -137,6 +137,9 @@ pub struct GlPresenter {
     overlay: GlOverlay,
     /// index 0 is the top screen, 1 the bottom, 2 the top one's picture for the right eye
     textures: [glow::Texture; 3],
+    /// the renderer's own textures the screens were last drawn from, a frame
+    /// the renderer shares its context and drew what the screen shows
+    gpu_textures: [Option<glow::Texture>; 3],
     /// the size each texture was last allocated at, so uploads can use tex_sub_image_2d when nothing changed
     sizes: [(u32, u32); 3],
     window: (u32, u32),
@@ -207,6 +210,7 @@ impl GlPresenter {
             vertex_array,
             overlay,
             textures: [textures[0], textures[1], textures[2]],
+            gpu_textures: [None; 3],
             sizes: [(0, 0); 3],
             window,
             arrangement: ScreenLayout::default(),
@@ -223,6 +227,13 @@ impl GlPresenter {
     }
 
     fn upload(&mut self, index: usize, image: &ScreenImage<'_>) {
+        // a picture the renderer drew stays in one of its textures, drawn from
+        // there with no upload at all
+        if let Some(texture) = image.gpu.and_then(|gpu| gpu.gl_texture) {
+            self.gpu_textures[index] = Some(texture);
+            return;
+        }
+        self.gpu_textures[index] = None;
         let gl = &self.gl;
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[index]));
@@ -282,9 +293,10 @@ impl GlPresenter {
         let gl = &self.gl;
         self.use_program(self.program);
         self.set_viewport(viewport);
+        let texture = self.gpu_textures[index].unwrap_or(self.textures[index]);
         unsafe {
             gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[index]));
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
         }
     }
@@ -308,9 +320,9 @@ impl GlPresenter {
                 gl.uniform_1_f32(Some(&location), self.window.1 as f32);
             }
             gl.active_texture(glow::TEXTURE1);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[2]));
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.gpu_textures[2].unwrap_or(self.textures[2])));
             gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[0]));
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.gpu_textures[0].unwrap_or(self.textures[0])));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
         }
     }

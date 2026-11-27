@@ -5044,6 +5044,8 @@ impl Hardware {
         let (top, bottom) = (((row_pixels - screen.columns) * scale) as f32, (row_pixels * scale) as f32);
         Ok(Some(crate::GpuScreen {
             view,
+            #[cfg(feature = "opengl")]
+            gl_texture: None,
             area: [left / width, top / height, (right - left) / width, (bottom - top) / height],
             bounds: [(left + 0.5) / width, (top + 0.5) / height, (right - 0.5) / width, (bottom - 0.5) / height],
         }))

@@ -752,6 +752,98 @@ fn alpha_function(value: super::Compare) -> u32 {
     }
 }
 
+/// one oversized triangle covers the target with no vertex buffer, for the
+/// transfer and the upright passes
+const FULLSCREEN_VERTEX_SHADER: &str = r#"#version 430 core
+void main() {
+    vec2 position = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);
+}
+"#;
+
+/// a display transfer between two surfaces the renderer holds, the same pixels
+/// the CPU engine writes: the rows read in the layouts' own orders, the block
+/// of input each output pixel covers averaged the way the CPU rounds it, the
+/// pixels past the copied rectangle left to what the surface already holds
+const TRANSFER_SHADER: &str = r#"#version 430 core
+uniform sampler2D source;
+// the pixels written, width and height
+uniform ivec2 copy_size;
+// the output surface's size
+uniform ivec2 out_size;
+// the input pixels averaged into each output pixel, across and down
+uniform ivec2 block;
+uniform int flip;
+uniform int out_tiled;
+uniform int in_tiled;
+// the surface row the input starts at, and the input surface's rows
+uniform int input_row;
+uniform int input_height;
+// the output keeps no alpha of its own, the copy's alpha stays at one
+uniform int alpha_forced;
+out vec4 color;
+void main() {
+    ivec2 at = ivec2(gl_FragCoord.xy);
+    // the guest row this fragment writes, then the copy row it reads
+    int out_y = out_tiled == 1 ? out_size.y - 1 - at.y : at.y;
+    int y = flip == 1 ? out_size.y - 1 - out_y : out_y;
+    if (at.x >= copy_size.x || y >= copy_size.y) {
+        discard;
+    }
+    uvec4 sum = uvec4(0u);
+    for (int dy = 0; dy < block.y; dy++) {
+        for (int dx = 0; dx < block.x; dx++) {
+            int src_x = at.x * block.x + dx;
+            int src_y = y * block.y + dy;
+            // a tiled surface's rows count from the top of its buffer, the
+            // texture's from the bottom, like the draw path's upload lays them
+            int row = in_tiled == 1 ? input_height - 1 - (input_row + src_y) : input_row + src_y;
+            sum += uvec4(round(texelFetch(source, ivec2(src_x, row), 0) * 255.0));
+        }
+    }
+    uint count = uint(block.x * block.y);
+    vec4 pixel = vec4((sum + count / 2u) / count) / 255.0;
+    if (alpha_forced == 1) {
+        pixel.a = 1.0;
+    }
+    color = pixel;
+}
+"#;
+
+/// a screen's picture turned upright for showing: the surface keeps a row per
+/// screen column, each running up the screen from its bottom, and the upright
+/// picture gets the screen's rows top first
+const UPRIGHT_SHADER: &str = r#"#version 430 core
+uniform sampler2D source;
+// the screen's pixels a column runs, and the buffer row the screen's first column sits in
+uniform int column_pixels;
+uniform int first_column;
+out vec4 color;
+void main() {
+    ivec2 at = ivec2(gl_FragCoord.xy);
+    color = texelFetch(source, ivec2(column_pixels - 1 - at.y, first_column + at.x), 0);
+}
+"#;
+
+/// a display transfer the OpenGL renderer takes itself, the same words the
+/// Vulkan renderer's carries
+pub(crate) struct Transfer {
+    pub(crate) input: u32,
+    pub(crate) output: u32,
+    pub(crate) input_width: u32,
+    pub(crate) output_width: u32,
+    pub(crate) output_height: u32,
+    /// the pixels written, width and height
+    pub(crate) copy: (u32, u32),
+    /// the input pixels averaged into each output pixel, across and down
+    pub(crate) scale: (u32, u32),
+    pub(crate) flip: bool,
+    pub(crate) input_linear: bool,
+    pub(crate) output_tiled: bool,
+    pub(crate) input_format: crate::format::ColorFormat,
+    pub(crate) output_format: crate::format::ColorFormat,
+}
+
 /// OpenGL resources are created and used on the thread where the context is current.
 pub(crate) struct OpenGlRasterizer {
     gl: std::sync::Arc<glow::Context>,
@@ -759,6 +851,14 @@ pub(crate) struct OpenGlRasterizer {
     uniforms: Uniforms,
     vertex_array: glow::VertexArray,
     vertices: glow::Buffer,
+    /// the program display transfers the renderer takes run on
+    transfer_program: glow::Program,
+    /// the program a screen's picture turns upright in
+    upright_program: glow::Program,
+    /// the vertex array the fullscreen passes draw thru, no attributes of its own
+    utility_vertex_array: glow::VertexArray,
+    /// the framebuffer the upright pictures render into
+    utility_framebuffer: glow::Framebuffer,
     surfaces: HashMap<SurfaceKey, Surface>,
     surface_bytes: u64,
     surface_clock: u64,
@@ -806,6 +906,10 @@ impl Drop for OpenGlRasterizer {
             self.gl.delete_vertex_array(self.vertex_array);
             self.gl.delete_buffer(self.vertices);
             self.gl.delete_program(self.program);
+            self.gl.delete_program(self.transfer_program);
+            self.gl.delete_program(self.upright_program);
+            self.gl.delete_vertex_array(self.utility_vertex_array);
+            self.gl.delete_framebuffer(self.utility_framebuffer);
         }
     }
 }
@@ -818,6 +922,9 @@ struct SurfaceKey {
     height: u32,
     depth_addr: u32,
     depth_bytes: u32,
+    /// a linear buffer's rows lie in memory order (a screen's picture a
+    /// transfer wrote), not in the Morton order draw targets keep
+    linear: bool,
 }
 
 struct Surface {
@@ -829,6 +936,20 @@ struct Surface {
     depth_dirty: bool,
     storage_bytes: u64,
     last_used: u64,
+    /// how many pictures wrote a linear buffer, the screen ref's batch
+    picture: u64,
+    /// the picture turned upright for showing, for a presenter sharing the context
+    upright: Option<Upright>,
+}
+
+/// a linear surface's picture, transposed upright into its own texture at the
+/// screen's own size
+struct Upright {
+    texture: glow::Texture,
+    /// the picture that is in it
+    picture: u64,
+    width: u32,
+    height: u32,
 }
 
 impl OpenGlRasterizer {
@@ -842,7 +963,7 @@ impl OpenGlRasterizer {
         }
 
         unsafe {
-            let program = link_program(&gl)?;
+            let program = link_program(&gl, VERTEX_SHADER, FRAGMENT_SHADER)?;
             let vertex_array = match gl.create_vertex_array() {
                 Ok(vertex_array) => vertex_array,
                 Err(error) => {
@@ -973,12 +1094,59 @@ impl OpenGlRasterizer {
                 fog_color: gl.get_uniform_location(program, "fog_color"),
             };
 
+            // the transfer and upright programs, and the objects their
+            // fullscreen passes share
+            let (transfer_program, upright_program, utility_vertex_array, utility_framebuffer) = {
+                let result = (|| {
+                    let transfer = link_program(&gl, FULLSCREEN_VERTEX_SHADER, TRANSFER_SHADER)?;
+                    let upright = match link_program(&gl, FULLSCREEN_VERTEX_SHADER, UPRIGHT_SHADER) {
+                        Ok(upright) => upright,
+                        Err(error) => {
+                            gl.delete_program(transfer);
+                            return Err(error);
+                        }
+                    };
+                    let vertex_array = match gl.create_vertex_array() {
+                        Ok(vertex_array) => vertex_array,
+                        Err(error) => {
+                            gl.delete_program(transfer);
+                            gl.delete_program(upright);
+                            return Err(error);
+                        }
+                    };
+                    let framebuffer = match gl.create_framebuffer() {
+                        Ok(framebuffer) => framebuffer,
+                        Err(error) => {
+                            gl.delete_program(transfer);
+                            gl.delete_program(upright);
+                            gl.delete_vertex_array(vertex_array);
+                            return Err(error);
+                        }
+                    };
+                    Ok((transfer, upright, vertex_array, framebuffer))
+                })();
+                match result {
+                    Ok(made) => made,
+                    Err(error) => {
+                        gl.delete_buffer(vertices);
+                        gl.delete_vertex_array(vertex_array);
+                        gl.delete_texture(lookup_tables);
+                        gl.delete_program(program);
+                        return Err(error);
+                    }
+                }
+            };
+
             Ok(Self {
                 gl,
                 program,
                 uniforms,
                 vertex_array,
                 vertices,
+                transfer_program,
+                upright_program,
+                utility_vertex_array,
+                utility_framebuffer,
                 surfaces: HashMap::new(),
                 surface_bytes: 0,
                 surface_clock: 0,
@@ -1025,6 +1193,7 @@ impl OpenGlRasterizer {
             height,
             depth_addr: depth.map_or(0, |d| d.addr),
             depth_bytes: depth.map_or(0, |d| d.bytes),
+            linear: false,
         };
         let cached = self.surfaces.contains_key(&key);
         let storage_bytes = surface_storage_bytes(width, height, key.depth_bytes);
@@ -1066,6 +1235,8 @@ impl OpenGlRasterizer {
                     depth_dirty: false,
                     storage_bytes,
                     last_used: self.surface_clock,
+                    picture: 0,
+                    upright: None,
                 },
             );
             self.surface_bytes = self.surface_bytes.saturating_add(storage_bytes);
@@ -1943,8 +2114,14 @@ impl OpenGlRasterizer {
                     );
                     self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 }
-                linear_to_tiled(&linear, &mut tiled, width, height, format);
-                memory.write(key.addr, &tiled);
+                if key.linear {
+                    let mut rows = vec![0u8; tiled.len()];
+                    linear_to_rows(&linear, &mut rows, width, height, format);
+                    memory.write(key.addr, &rows);
+                } else {
+                    linear_to_tiled(&linear, &mut tiled, width, height, format);
+                    memory.write(key.addr, &tiled);
+                }
                 surface.dirty = false;
             }
             if surface.depth_dirty && key.depth_bytes != 0 {
@@ -2012,6 +2189,461 @@ impl OpenGlRasterizer {
                 surface.initialized = false;
             }
         }
+    }
+
+    /// a display transfer out of a buffer the renderer holds (one it drew or an
+    /// earlier transfer wrote) done on the GPU, false when the input is anything
+    /// else, for the CPU to do. The output stays in a surface the renderer
+    /// keeps, guest memory untouched
+    pub(crate) fn display_transfer<M: GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        transfer: &Transfer,
+    ) -> Result<bool, String> {
+        let t = transfer;
+        let input_bpp = t.input_format.bytes_per_pixel() as u32;
+        let output_bpp = t.output_format.bytes_per_pixel() as u32;
+        // a tiled output of part of a tile goes to the CPU, which leaves out the
+        // pixels the layout puts past its end, like draws do
+        let whole = t.output_width.is_multiple_of(8) && t.output_height.is_multiple_of(8);
+        // flipped, an input shorter than the output fills the output's last
+        // rows, the CPU puts those where they go
+        let short = t.flip && t.copy.1 < t.output_height;
+        if t.copy.0 == 0 || t.copy.1 == 0 || (t.output_tiled && !whole) || short {
+            return Ok(false);
+        }
+        let output_key = SurfaceKey {
+            addr: t.output,
+            format: t.output_format as u32,
+            width: t.output_width,
+            height: t.output_height,
+            depth_addr: 0,
+            depth_bytes: 0,
+            linear: !t.output_tiled,
+        };
+        let output_bytes = t
+            .output_width
+            .saturating_mul(t.output_height)
+            .saturating_mul(output_bpp);
+        // room for the output before anything else looks the cache over, so
+        // the input surface cannot be the victim the output evicts
+        if !self.surfaces.contains_key(&output_key) {
+            self.evict_to_budget(
+                memory,
+                surface_storage_bytes(output_key.width, output_key.height, 0),
+            );
+        }
+        // the input rows read, from the first, which can start some rows into a
+        // buffer the renderer holds (titles draw both screens into one), a
+        // tiled buffer a row of tiles at a time
+        let rows = t.copy.1 * t.scale.1;
+        let step_rows = if t.input_linear { 1 } else { 8 };
+        let step_bytes = step_rows * t.input_width * input_bpp;
+        let row_in = |key: &SurfaceKey| -> Option<u32> {
+            if !(key.linear == t.input_linear
+                && key.format == t.input_format as u32
+                && key.width == t.input_width)
+            {
+                return None;
+            }
+            let offset = t
+                .input
+                .checked_sub(key.addr)
+                .filter(|offset| offset % step_bytes == 0)?;
+            let row = offset / step_bytes * step_rows;
+            (row + rows <= key.height).then_some(row)
+        };
+        let Some((input_key, row)) = self
+            .surfaces
+            .iter()
+            .filter_map(|(key, surface)| row_in(key).map(|row| (row, surface.last_used, *key)))
+            .max_by_key(|&(_, used, _)| used)
+            .map(|(row, _, key)| (key, row))
+        else {
+            return Ok(false);
+        };
+        // rows read where the output goes, the CPU does in order; the rest of
+        // the input's buffer can be under the output, and the output drawn
+        // over those is the overdrawn below
+        let row_bytes = u64::from(t.input_width * input_bpp);
+        let read_start = u64::from(input_key.addr) + u64::from(row) * row_bytes;
+        let read_end = read_start + u64::from(rows) * row_bytes;
+        let output_end = u64::from(t.output) + u64::from(output_bytes);
+        if read_start < output_end && u64::from(t.output) < read_end {
+            return Ok(false);
+        }
+        // the input's rows not on the GPU yet upload from guest memory, which
+        // has whatever overlapping surfaces hold resolved first
+        let input_bytes = input_key
+            .width
+            .saturating_mul(input_key.height)
+            .saturating_mul(input_bpp);
+        self.surface_clock = self.surface_clock.wrapping_add(1);
+        let input_uploaded = {
+            let surface = self.surfaces.get_mut(&input_key).expect("the input was found");
+            surface.last_used = self.surface_clock;
+            let texture = surface.color;
+            (surface.initialized, texture)
+        };
+        if !input_uploaded.0 {
+            self.sync_except(memory, input_key.addr, input_bytes, true, Some(input_key));
+            let mut guest = vec![0u8; input_bytes as usize];
+            memory.read(input_key.addr, &mut guest);
+            let linear = if input_key.linear {
+                rows_to_linear(&guest, input_key.width, input_key.height, t.input_format)
+            } else {
+                tiled_to_linear(&guest, input_key.width, input_key.height, t.input_format)
+            };
+            unsafe {
+                self.gl.bind_texture(glow::TEXTURE_2D, Some(input_uploaded.1));
+                self.gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    input_key.width as i32,
+                    input_key.height as i32,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&linear)),
+                );
+            }
+            self.surfaces
+                .get_mut(&input_key)
+                .expect("the input was found")
+                .initialized = true;
+        }
+        // the output surface, made fresh or kept, its rows not on the GPU
+        // uploaded like the input's
+        if !self.surfaces.contains_key(&output_key) {
+            self.sync(memory, output_key.addr, output_bytes, true);
+            let (framebuffer, color, depth) =
+                unsafe { create_surface(&self.gl, output_key.width, output_key.height, 0)? };
+            self.surface_clock = self.surface_clock.wrapping_add(1);
+            let storage_bytes = surface_storage_bytes(output_key.width, output_key.height, 0);
+            self.surfaces.insert(
+                output_key,
+                Surface {
+                    framebuffer,
+                    color,
+                    depth,
+                    initialized: false,
+                    dirty: false,
+                    depth_dirty: false,
+                    storage_bytes,
+                    last_used: self.surface_clock,
+                    picture: 0,
+                    upright: None,
+                },
+            );
+            self.surface_bytes = self.surface_bytes.saturating_add(storage_bytes);
+        }
+        self.surface_clock = self.surface_clock.wrapping_add(1);
+        let output_ready = {
+            let surface = self.surfaces.get_mut(&output_key).expect("made or found above");
+            surface.last_used = self.surface_clock;
+            (surface.initialized, surface.framebuffer)
+        };
+        if !output_ready.0 {
+            self.sync_except(memory, output_key.addr, output_bytes, true, Some(output_key));
+            let mut guest = vec![0u8; output_bytes as usize];
+            memory.read(output_key.addr, &mut guest);
+            let linear = if output_key.linear {
+                rows_to_linear(&guest, output_key.width, output_key.height, t.output_format)
+            } else {
+                tiled_to_linear(&guest, output_key.width, output_key.height, t.output_format)
+            };
+            unsafe {
+                let color = self
+                    .surfaces
+                    .get(&output_key)
+                    .expect("made or found above")
+                    .color;
+                self.gl.bind_texture(glow::TEXTURE_2D, Some(color));
+                self.gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    output_key.width as i32,
+                    output_key.height as i32,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&linear)),
+                );
+            }
+            self.surfaces
+                .get_mut(&output_key)
+                .expect("made or found above")
+                .initialized = true;
+        }
+        // the conversion drawn, every size and row the CPU's own engine writes
+        unsafe {
+            let gl = &self.gl;
+            let uniform =
+                |name: &str| gl.get_uniform_location(self.transfer_program, name);
+            gl.use_program(Some(self.transfer_program));
+            gl.bind_vertex_array(Some(self.utility_vertex_array));
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(output_ready.1));
+            if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                gl.bind_vertex_array(None);
+                return Err("OpenGL transfer framebuffer is incomplete".to_owned());
+            }
+            gl.viewport(0, 0, output_key.width as i32, output_key.height as i32);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::STENCIL_TEST);
+            gl.disable(glow::BLEND);
+            gl.disable(glow::CULL_FACE);
+            gl.disable(glow::DITHER);
+            gl.depth_mask(true);
+            gl.stencil_mask(0xFF);
+            gl.color_mask(true, true, true, true);
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(input_uploaded.1));
+            if let Some(location) = uniform("copy_size") {
+                gl.uniform_2_i32(Some(&location), t.copy.0 as i32, t.copy.1 as i32);
+            }
+            if let Some(location) = uniform("out_size") {
+                gl.uniform_2_i32(
+                    Some(&location),
+                    output_key.width as i32,
+                    output_key.height as i32,
+                );
+            }
+            if let Some(location) = uniform("block") {
+                gl.uniform_2_i32(Some(&location), t.scale.0 as i32, t.scale.1 as i32);
+            }
+            if let Some(location) = uniform("flip") {
+                gl.uniform_1_i32(Some(&location), t.flip as i32);
+            }
+            if let Some(location) = uniform("out_tiled") {
+                gl.uniform_1_i32(Some(&location), t.output_tiled as i32);
+            }
+            if let Some(location) = uniform("in_tiled") {
+                gl.uniform_1_i32(Some(&location), (!t.input_linear) as i32);
+            }
+            if let Some(location) = uniform("input_row") {
+                gl.uniform_1_i32(Some(&location), row as i32);
+            }
+            if let Some(location) = uniform("input_height") {
+                gl.uniform_1_i32(Some(&location), input_key.height as i32);
+            }
+            if let Some(location) = uniform("alpha_forced") {
+                let keeps_no_alpha = matches!(
+                    t.output_format,
+                    crate::format::ColorFormat::Rgb8 | crate::format::ColorFormat::Rgb565
+                );
+                gl.uniform_1_i32(Some(&location), keeps_no_alpha as i32);
+            }
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            gl.bind_vertex_array(None);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        let surface = self
+            .surfaces
+            .get_mut(&output_key)
+            .expect("made or found above");
+        surface.initialized = true;
+        surface.dirty = true;
+        surface.picture = surface.picture.wrapping_add(1);
+        memory.guard(output_key.addr, output_bytes);
+        memory.guard_writes(output_key.addr, output_bytes);
+        Ok(true)
+    }
+
+    /// the newest picture a display transfer left in a buffer for a screen,
+    /// while the renderer still holds it and guest memory has not been asked
+    /// for it yet
+    pub(crate) fn screen(
+        &mut self,
+        addr: u32,
+        (row_pixels, rows): (u32, u32),
+        stride: u32,
+        format: crate::format::ColorFormat,
+        guest: &[u8],
+    ) -> Option<crate::ScreenRef> {
+        // unlike the Vulkan renderer's, the GL one has no shadow of what it
+        // wrote to compare the guest bytes against: the picture shows only
+        // while the surface is dirty, the renderer still holding it
+        let _ = guest;
+        let row_bytes = u64::from(stride) * format.bytes_per_pixel() as u64;
+        let (key, surface) = self.surfaces.iter().find(|(key, surface)| {
+            key.linear
+                && key.format == format as u32
+                && key.width == stride
+                && stride >= row_pixels
+                && addr >= key.addr
+                && u64::from(addr - key.addr) % row_bytes == 0
+                && u64::from(addr - key.addr) / row_bytes + u64::from(rows) <= u64::from(key.height)
+                && surface.dirty
+        })?;
+        let first = (u64::from(addr - key.addr) / row_bytes) as u32;
+        Some(crate::ScreenRef {
+            addr: key.addr,
+            size: (key.width, key.height),
+            format,
+            batch: surface.picture,
+            rows: (first, rows),
+            columns: row_pixels,
+        })
+    }
+
+    /// the image a screen's picture is upright in, for a presenter sharing the
+    /// context, none once a later picture took its buffer
+    pub(crate) fn screen_image(
+        &mut self,
+        screen: crate::ScreenRef,
+    ) -> Result<Option<crate::GpuScreen>, String> {
+        match self.upright(screen) {
+            Some((texture, width, height)) => Ok(Some(crate::GpuScreen {
+                #[cfg(feature = "vulkan")]
+                view: ash::vk::ImageView::null(),
+                gl_texture: Some(texture),
+                area: [0.0, 0.0, 1.0, 1.0],
+                bounds: [
+                    0.5 / width as f32,
+                    0.5 / height as f32,
+                    1.0 - 0.5 / width as f32,
+                    1.0 - 0.5 / height as f32,
+                ],
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// a screen's picture upright, RGBA like the screen shows it, read back
+    /// from the GPU, none once a later picture took its buffer
+    pub(crate) fn upright_picture(
+        &mut self,
+        screen: crate::ScreenRef,
+        between: bool,
+    ) -> Option<crate::Picture> {
+        // no pictures in between draws here, the Vulkan path's interpolation
+        if between {
+            return None;
+        }
+        let (texture, width, height) = self.upright(screen)?;
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        unsafe {
+            self.gl.active_texture(glow::TEXTURE0);
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            self.gl.get_tex_image(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+        }
+        Some((std::sync::Arc::new(pixels), 1))
+    }
+
+    /// the upright picture of a screen's buffer, drawn into the surface's own
+    /// texture when the picture is not the one already there
+    fn upright(&mut self, screen: crate::ScreenRef) -> Option<(glow::Texture, u32, u32)> {
+        let (row_pixels, rows_count) = screen.size;
+        let (width, height) = (screen.rows.1, screen.columns);
+        let (key, color, ready, kept) = {
+            let key = *self.surfaces.keys().find(|key| {
+                key.linear
+                    && key.addr == screen.addr
+                    && key.width == row_pixels
+                    && key.height == rows_count
+                    && key.format == screen.format as u32
+            })?;
+            let surface = self.surfaces.get_mut(&key)?;
+            if surface.picture != screen.batch {
+                return None;
+            }
+            let ready = surface.upright.as_ref().is_some_and(|upright| {
+                upright.picture == screen.batch && upright.width == width && upright.height == height
+            });
+            let kept = surface
+                .upright
+                .as_ref()
+                .map(|upright| (upright.texture, upright.width, upright.height));
+            (key, surface.color, ready, kept)
+        };
+        if ready {
+            let (texture, width, height) = kept.expect("ready means one is kept");
+            return Some((texture, width, height));
+        }
+        // the texture the picture renders into, kept when its size fits
+        let made = match kept {
+            Some((texture, kept_width, kept_height)) if kept_width == width && kept_height == height => {
+                texture
+            }
+            Some((texture, _, _)) => {
+                unsafe {
+                    self.gl.delete_texture(texture);
+                    self.gl
+                        .create_texture()
+                        .expect("a texture for the upright picture")
+                }
+            }
+            None => unsafe {
+                self.gl
+                    .create_texture()
+                    .expect("a texture for the upright picture")
+            },
+        };
+        unsafe {
+            let gl = &self.gl;
+            let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
+            let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
+            gl.bind_texture(glow::TEXTURE_2D, Some(made));
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                width as i32,
+                height as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.utility_framebuffer));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(made),
+                0,
+            );
+            gl.viewport(0, 0, width as i32, height as i32);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::STENCIL_TEST);
+            gl.disable(glow::BLEND);
+            gl.disable(glow::CULL_FACE);
+            gl.disable(glow::DITHER);
+            gl.color_mask(true, true, true, true);
+            gl.use_program(Some(self.upright_program));
+            gl.bind_vertex_array(Some(self.utility_vertex_array));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(color));
+            if let Some(location) = gl.get_uniform_location(self.upright_program, "column_pixels") {
+                gl.uniform_1_i32(Some(&location), row_pixels as i32);
+            }
+            if let Some(location) = gl.get_uniform_location(self.upright_program, "first_column") {
+                gl.uniform_1_i32(Some(&location), screen.rows.0 as i32);
+            }
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            gl.bind_vertex_array(None);
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, previous_draw);
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, previous_read);
+        }
+        let surface = self.surfaces.get_mut(&key)?;
+        let picture = surface.picture;
+        surface.upright = Some(Upright { texture: made, picture, width, height });
+        Some((made, width, height))
     }
 }
 
@@ -2158,17 +2790,24 @@ unsafe fn delete_surface(gl: &glow::Context, surface: Surface) {
         if let Some(depth) = surface.depth {
             gl.delete_texture(depth);
         }
+        if let Some(upright) = surface.upright {
+            gl.delete_texture(upright.texture);
+        }
     }
 }
 
-unsafe fn link_program(gl: &glow::Context) -> Result<glow::Program, String> {
+unsafe fn link_program(
+    gl: &glow::Context,
+    vertex_source: &str,
+    fragment_source: &str,
+) -> Result<glow::Program, String> {
     unsafe {
         let program = gl.create_program().map_err(|error| error.to_string())?;
         let mut shaders = Vec::with_capacity(2);
         let result = (|| {
             for (kind, source) in [
-                (glow::VERTEX_SHADER, VERTEX_SHADER),
-                (glow::FRAGMENT_SHADER, FRAGMENT_SHADER),
+                (glow::VERTEX_SHADER, vertex_source),
+                (glow::FRAGMENT_SHADER, fragment_source),
             ] {
                 let shader = gl.create_shader(kind).map_err(|error| error.to_string())?;
                 shaders.push(shader);
@@ -2321,6 +2960,45 @@ fn tiled_to_linear(
         }
     }
     linear
+}
+
+/// a linear buffer's guest rows decode into linear RGBA rows for the upload,
+/// the rows kept in memory order like the buffer lays them
+fn rows_to_linear(
+    guest: &[u8],
+    width: u32,
+    height: u32,
+    format: crate::format::ColorFormat,
+) -> Vec<u8> {
+    let bytes_per_pixel = format.bytes_per_pixel() as usize;
+    let mut linear = vec![0; (width * height * 4) as usize];
+    for pixel in 0..(width * height) as usize {
+        let source = pixel * bytes_per_pixel;
+        let color = format.decode(&guest[source..source + bytes_per_pixel]);
+        linear[pixel * 4..(pixel + 1) * 4].copy_from_slice(&color);
+    }
+    linear
+}
+
+/// linear RGBA rows pack back into a linear buffer's guest rows
+fn linear_to_rows(
+    linear: &[u8],
+    guest: &mut [u8],
+    width: u32,
+    height: u32,
+    format: crate::format::ColorFormat,
+) {
+    let bytes_per_pixel = format.bytes_per_pixel() as usize;
+    for pixel in 0..(width * height) as usize {
+        let source = pixel * 4;
+        let mut encoded = [0; 4];
+        format.encode(
+            linear[source..source + 4].try_into().expect("RGBA pixel"),
+            &mut encoded,
+        );
+        guest[pixel * bytes_per_pixel..(pixel + 1) * bytes_per_pixel]
+            .copy_from_slice(&encoded[..bytes_per_pixel]);
+    }
 }
 
 /// linear RGBA rows pack back into the surface's tiled guest bytes

@@ -435,12 +435,6 @@ impl Gpu {
         let output_paddr = output_paddr.wrapping_add(skew);
         let (input_base, output_base) = (memory.translate(input_paddr), memory.translate(output_paddr));
 
-        #[cfg(feature = "opengl")]
-        if let Some(renderer) = self.resources.opengl.as_mut() {
-            renderer.sync(memory, input_base, input_width.saturating_mul(input_height).saturating_mul(4), true);
-            renderer.sync(memory, output_base, output_width.saturating_mul(output_height).saturating_mul(4), true);
-        }
-
         log::debug!(
             "display transfer: 0x{input_paddr:08X} {input_width}x{input_height} \
              {input_format:?} {} -> 0x{output_paddr:08X} {output_width}x{output_height} \
@@ -467,6 +461,33 @@ impl Gpu {
                 output_format,
             };
             match hardware.display_transfer(memory, &transfer) {
+                Ok(true) => {
+                    self.transfers += 1;
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => log::error!("the GPU could not transfer a buffer, {error}"),
+            }
+        }
+        // and so does the OpenGL one, out of a surface it drew or an earlier
+        // transfer wrote, the output staying in a surface it keeps
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            let transfer = raster::opengl::Transfer {
+                input: input_base,
+                output: output_base,
+                input_width,
+                output_width,
+                output_height,
+                copy: (copy_width, copy_height),
+                scale: (scale_x, scale_y),
+                flip: flip_vertically,
+                input_linear,
+                output_tiled,
+                input_format,
+                output_format,
+            };
+            match renderer.display_transfer(memory, &transfer) {
                 Ok(true) => {
                     self.transfers += 1;
                     return;
@@ -705,7 +726,7 @@ impl Gpu {
     pub fn enable_opengl_renderer(&mut self, context: SharedOpenGlContext) -> Result<String, String> {
         let renderer = unsafe { raster::opengl::OpenGlRasterizer::new(context)? };
         self.resources.opengl = Some(renderer);
-        Ok("OpenGL 4.3 MVP at 1x".to_owned())
+        Ok("OpenGL 4.3 at 1x, shown straight from the GPU".to_owned())
     }
 
     /// draws the texture pack's pictures in place of the textures they replace, or no pack's
@@ -752,6 +773,11 @@ impl Gpu {
         if let Some(hardware) = self.resources.hardware.as_ref() {
             return hardware.direct();
         }
+        // the OpenGL presenter always shares the renderer's context
+        #[cfg(feature = "opengl")]
+        if self.resources.opengl.is_some() {
+            return true;
+        }
         false
     }
 
@@ -765,7 +791,14 @@ impl Gpu {
                 Err(error) => log::error!("the GPU could not show a screen, {error}"),
             }
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            match renderer.screen_image(screen) {
+                Ok(image) => return image,
+                Err(error) => log::error!("the GPU could not show a screen, {error}"),
+            }
+        }
+        #[cfg(not(any(feature = "vulkan", feature = "opengl")))]
         let _ = screen;
         None
     }
@@ -822,7 +855,13 @@ impl Gpu {
         if let Some(hardware) = self.resources.hardware.as_mut() {
             return hardware.upright_picture(screen, between);
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            if let Some(picture) = renderer.upright_picture(screen, between) {
+                return Some(picture);
+            }
+        }
+        #[cfg(not(any(feature = "vulkan", feature = "opengl")))]
         let _ = (screen, between);
         None
     }
@@ -844,7 +883,11 @@ impl Gpu {
         if let Some(hardware) = self.resources.hardware.as_mut() {
             return hardware.screen(addr, size, stride, format, guest);
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            return renderer.screen(addr, size, stride, format, guest);
+        }
+        #[cfg(not(any(feature = "vulkan", feature = "opengl")))]
         let _ = (addr, size, stride, format, guest);
         None
     }

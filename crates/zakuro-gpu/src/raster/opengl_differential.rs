@@ -14,6 +14,7 @@
 //! `xvfb-run -a cargo test -p zakuro-gpu --features opengl`
 
 use super::tests::rasterize_shaded;
+use glow::HasContext;
 use crate::format::morton_offset;
 use crate::raster::*;
 use crate::{Gpu, GpuMemory, SharedOpenGlContext, SoftwareRenderer};
@@ -3281,24 +3282,257 @@ fn opengl_command_list_draws_and_transfers_like_the_cpu() {
         "the drawn target stayed resident",
     );
 
-    // the display transfer reads the drawn buffer: its sync has to resolve it first,
-    // then the converted rows match the CPU's byte for byte
+    // the display transfer reads the drawn buffer on the GPU, the drawn target
+    // staying resident and the output held in a surface of its own, and the
+    // converted rows match the CPU's byte for byte once they reach memory
     let dimensions = 16 | (16 << 16);
     gl_gpu.display_transfer(&mut gl_memory, COLOR, OUT, dimensions, dimensions, 0);
     cpu_gpu.display_transfer(&mut cpu_memory, COLOR, OUT, dimensions, dimensions, 0);
-    assert!(
-        gl_memory.writes_over(COLOR, COLOR_BYTES) >= 1,
-        "the transfer's sync never resolved the drawn target",
+    assert_eq!(
+        gl_memory.writes_over(COLOR, COLOR_BYTES),
+        0,
+        "the transfer read the drawn buffer on the GPU but resolved it",
     );
+    assert!(
+        gl_memory.guarded_writes(OUT, 16 * 16 * 4),
+        "the transferred buffer is not guarded against CPU writes",
+    );
+    gl_gpu.sync_memory(&mut gl_memory, OUT, 16 * 16 * 4);
     assert_eq!(
         gl_memory.region(OUT, 16 * 16 * 4),
         cpu_memory.region(OUT, 16 * 16 * 4),
         "the transferred picture differs",
     );
+    // and a sync of the drawn target resolves it like the CPU's run holds it
+    gl_gpu.sync_memory(&mut gl_memory, COLOR, COLOR_BYTES);
     assert_eq!(
         gl_memory.region(COLOR, COLOR_BYTES),
         cpu_memory.region(COLOR, COLOR_BYTES),
         "the resolved target differs",
+    );
+}
+
+/// the display transfers the OpenGL renderer takes run on the GPU — the input
+/// staying resident, the output held or written byte for byte — and the ones it
+/// refuses still reach the CPU engine, which the run matches
+#[test]
+fn opengl_display_transfers_run_on_the_gpu_and_match_the_cpu() {
+    // every case draws the target thru a command list first, like the
+    // full-path test does, then transfers it with its flags
+    let case = |flags: u32, input_dimensions: u32, output_dimensions: u32| -> Option<(CountingMemory, CountingMemory)> {
+        let (mut gl_gpu, mut gl_memory) = gpu_with_draw(0, true, true)?;
+        let (mut cpu_gpu, mut cpu_memory) = gpu_with_draw(0, true, false)?;
+        gl_gpu.display_transfer(&mut gl_memory, COLOR, OUT, input_dimensions, output_dimensions, flags);
+        cpu_gpu.display_transfer(&mut cpu_memory, COLOR, OUT, input_dimensions, output_dimensions, flags);
+        // what the GPU kept only reaches memory when something asks for it
+        gl_gpu.sync_memory(&mut gl_memory, OUT, 16 * 16 * 4);
+        Some((cpu_memory, gl_memory))
+    };
+    let dimensions = 16 | (16 << 16);
+    // a straight transfer out of the drawn buffer, tiled into the screen's
+    // rows, the GPU reading its own surface
+    {
+        let Some((cpu, gl)) = case(0, dimensions, dimensions) else {
+            return;
+        };
+        assert_eq!(
+            gl.writes_over(COLOR, COLOR_BYTES),
+            0,
+            "the transfer read the drawn buffer on the GPU but resolved it",
+        );
+        assert_eq!(
+            gl.region(OUT, 16 * 16 * 4),
+            cpu.region(OUT, 16 * 16 * 4),
+            "the straight transfer differs",
+        );
+    }
+    // a tiled output, the effects-buffer kind the next draw renders into
+    {
+        let Some((cpu, gl)) = case(1 << 5, dimensions, dimensions) else {
+            return;
+        };
+        assert_eq!(
+            gl.writes_over(COLOR, COLOR_BYTES),
+            0,
+            "the tiled transfer resolved the drawn buffer",
+        );
+        assert_eq!(
+            gl.region(OUT, 16 * 16 * 4),
+            cpu.region(OUT, 16 * 16 * 4),
+            "the tiled transfer differs",
+        );
+    }
+    // flipped, the rows read from the other end
+    {
+        let Some((cpu, gl)) = case(1, dimensions, dimensions) else {
+            return;
+        };
+        assert_eq!(
+            gl.writes_over(COLOR, COLOR_BYTES),
+            0,
+            "the flipped transfer resolved the drawn buffer",
+        );
+        assert_eq!(
+            gl.region(OUT, 16 * 16 * 4),
+            cpu.region(OUT, 16 * 16 * 4),
+            "the flipped transfer differs",
+        );
+    }
+    // halved, each output pixel the average of its 2x2 block the way the CPU
+    // rounds it, the output's register counting input pixels
+    {
+        let Some((cpu, gl)) = case(2 << 24, dimensions, dimensions) else {
+            return;
+        };
+        assert_eq!(
+            gl.writes_over(COLOR, COLOR_BYTES),
+            0,
+            "the halved transfer resolved the drawn buffer",
+        );
+        assert_eq!(
+            gl.region(OUT, 8 * 8 * 4),
+            cpu.region(OUT, 8 * 8 * 4),
+            "the halved transfer differs",
+        );
+    }
+    // converted into the screen's own format, RGB565, the guest bytes packing
+    // the same pixels
+    {
+        let Some((cpu, gl)) = case(2 << 12, dimensions, dimensions) else {
+            return;
+        };
+        assert_eq!(
+            gl.writes_over(COLOR, COLOR_BYTES),
+            0,
+            "the RGB565 transfer resolved the drawn buffer",
+        );
+        assert_eq!(
+            gl.region(OUT, 16 * 16 * 2),
+            cpu.region(OUT, 16 * 16 * 2),
+            "the RGB565 transfer differs",
+        );
+    }
+    // chained: the linear buffer an earlier transfer wrote is the next one's
+    // input, read from the GPU it stayed in
+    {
+        let Some((mut gl_gpu, mut gl_memory)) = gpu_with_draw(0, true, true) else {
+            return;
+        };
+        let Some((mut cpu_gpu, mut cpu_memory)) = gpu_with_draw(0, true, false) else {
+            return;
+        };
+        gl_gpu.display_transfer(&mut gl_memory, COLOR, OUT, dimensions, dimensions, 0);
+        cpu_gpu.display_transfer(&mut cpu_memory, COLOR, OUT, dimensions, dimensions, 0);
+        // the second transfer reads the first's linear output back into tiles
+        gl_gpu.display_transfer(&mut gl_memory, OUT, OUT + 16 * 16 * 4, dimensions, dimensions, 1 << 1);
+        cpu_gpu.display_transfer(&mut cpu_memory, OUT, OUT + 16 * 16 * 4, dimensions, dimensions, 1 << 1);
+        assert_eq!(
+            gl_memory.writes_over(OUT, 16 * 16 * 4),
+            0,
+            "the chained transfer resolved the first picture",
+        );
+        gl_gpu.sync_memory(&mut gl_memory, OUT + 16 * 16 * 4, 16 * 16 * 4);
+        assert_eq!(
+            gl_memory.region(OUT + 16 * 16 * 4, 16 * 16 * 4),
+            cpu_memory.region(OUT + 16 * 16 * 4, 16 * 16 * 4),
+            "the chained transfer differs",
+        );
+    }
+    // flipped and cropped, the output's rows starting the skew the CPU applies:
+    // the input is shorter than the output is tall, which the GPU refuses
+    {
+        let Some((cpu, gl)) = case(1 | (1 << 2), 16 | (8 << 16), 8 | (16 << 16)) else {
+            return;
+        };
+        assert!(
+            gl.writes_over(COLOR, COLOR_BYTES) >= 1,
+            "the skewed transfer ran on the GPU",
+        );
+        assert_eq!(
+            gl.region(OUT, 8 * 16 * 4),
+            cpu.region(OUT, 8 * 16 * 4),
+            "the skewed transfer differs",
+        );
+    }
+    // a tiled output of part of a tile, which the GPU leaves to the CPU's
+    // layout, quirks and all
+    {
+        let Some((cpu, gl)) = case(1 << 5, dimensions, 12 | (16 << 16)) else {
+            return;
+        };
+        assert!(
+            gl.writes_over(COLOR, COLOR_BYTES) >= 1,
+            "the unaligned transfer ran on the GPU",
+        );
+        assert_eq!(
+            gl.region(OUT, 12 * 16 * 4),
+            cpu.region(OUT, 12 * 16 * 4),
+            "the unaligned transfer differs",
+        );
+    }
+}
+
+/// the picture a transfer left for a screen shows straight from the GPU: an
+/// upright texture like the presenter takes, equal to the CPU's own column
+/// reading, and gone once guest memory took the buffer back
+#[test]
+fn opengl_shows_transferred_screens_directly() {
+    let Some((mut gl_gpu, mut gl_memory)) = gpu_with_draw(0, true, true) else {
+        return;
+    };
+    let Some((mut cpu_gpu, mut cpu_memory)) = gpu_with_draw(0, true, false) else {
+        return;
+    };
+    let dimensions = 16 | (16 << 16);
+    gl_gpu.display_transfer(&mut gl_memory, COLOR, OUT, dimensions, dimensions, 0);
+    cpu_gpu.display_transfer(&mut cpu_memory, COLOR, OUT, dimensions, dimensions, 0);
+    // the screen shows the whole buffer, its rows the screen's columns
+    let Some(screen) = gl_gpu.scaled_screen(OUT, (16, 16), 16, crate::format::ColorFormat::Rgba8, gl_memory.region(OUT, 16 * 16 * 4)) else {
+        panic!("the transfer's picture was not shown straight from the GPU");
+    };
+    assert_eq!(screen.size, (16, 16), "the screen ref names the whole buffer");
+    assert_eq!(screen.rows, (0, 16), "the buffer's first row is the screen's first column");
+    let Some(image) = gl_gpu.screen_image(screen) else {
+        panic!("no picture came back for the screen");
+    };
+    let Some(texture) = image.gl_texture else {
+        panic!("the picture is not an OpenGL texture");
+    };
+    // read the upright texture back, the screen's rows top first
+    let mut upright = vec![0u8; 16 * 16 * 4];
+    let gl = shared_opengl().expect("the context the rasterizer drew on");
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.get_tex_image(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(Some(&mut upright)),
+        );
+    }
+    // the CPU's own reading of the transferred buffer: column major in memory
+    // and the panel scans bottom to top, like read_screen_at works it
+    let source = cpu_memory.region(OUT, 16 * 16 * 4);
+    for x in 0..16u32 {
+        for y in 0..16u32 {
+            let pixel = &source[((x * 16 + (15 - y)) * 4) as usize..((x * 16 + (15 - y)) * 4 + 4) as usize];
+            let shown = &upright[((y * 16 + x) * 4) as usize..((y * 16 + x) * 4 + 4) as usize];
+            assert_eq!(shown, pixel, "the upright picture differs at ({x},{y})");
+        }
+    }
+    // and once guest memory takes the buffer back, the GPU shows nothing
+    gl_gpu.sync_memory(&mut gl_memory, OUT, 16 * 16 * 4);
+    assert!(
+        gl_gpu
+            .scaled_screen(OUT, (16, 16), 16, crate::format::ColorFormat::Rgba8, gl_memory.region(OUT, 16 * 16 * 4))
+            .is_none(),
+        "a resolved buffer still showed straight from the GPU",
+    );
+    assert_eq!(
+        gl_memory.region(OUT, 16 * 16 * 4),
+        cpu_memory.region(OUT, 16 * 16 * 4),
+        "the resolved screen buffer differs",
     );
 }
 
@@ -3592,11 +3826,7 @@ fn opengl_16bit_targets_match_the_cpu() {
             let mut cpu = CountingMemory::zeroed(0x1_0000);
             let mut gl = CountingMemory::zeroed(0x1_0000);
             let quad = slanted(
-                [
-                    [0.9, 0.1, 0.3, 0.8].into(),
-                    [0.2, 0.8, 0.6, 0.3].into(),
-                    [0.5, 0.4, 0.9, 0.6].into(),
-                ],
+                [[0.9, 0.1, 0.3, 0.8], [0.2, 0.8, 0.6, 0.3], [0.5, 0.4, 0.9, 0.6]],
                 [1.3, 0.7, 1.1],
                 -0.4,
             );

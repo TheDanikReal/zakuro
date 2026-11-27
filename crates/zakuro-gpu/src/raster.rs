@@ -12,6 +12,11 @@ use crate::lighting::{Lighting, Tables};
 pub(crate) mod hardware;
 #[cfg(feature = "opengl")]
 pub(crate) mod opengl;
+
+/// the OpenGL rasterizer's differential tests against the CPU one
+#[cfg(all(test, feature = "opengl"))]
+#[path = "raster/opengl_differential.rs"]
+mod opengl_differential;
 use crate::texture::TextureFormat;
 use crate::shader::{self, ShaderUnit, Vec4};
 use crate::{format::ColorFormat, GpuMemory};
@@ -3382,7 +3387,7 @@ mod tests {
     /// guest memory seen like the GPU sees it, physical VRAM and FCRAM translate to different virtual windows
     /// its first MBs lie in one piece like the linear heap and VRAM do, unless it's scattered
     #[derive(Clone)]
-    struct ConsoleMemory {
+    pub(crate) struct ConsoleMemory {
         flat: Vec<u8>,
         rest: HashMap<u32, u8>,
         /// does slice hand out the flat bytes
@@ -3500,7 +3505,7 @@ mod tests {
     const DEPTH: u32 = 0x3000;
 
     /// the inverse of decode_float24, for normal values
-    fn float24(value: f32) -> u32 {
+    pub(crate) fn float24(value: f32) -> u32 {
         if value == 0.0 {
             return 0;
         }
@@ -3510,7 +3515,7 @@ mod tests {
     }
 
     /// an 8x8 RGBA8 target w/ color writes on and a D24S8 buffer beside it
-    fn rasterize_shaded<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, shaded: &[Vertex]) -> u32 {
+    pub(crate) fn rasterize_shaded<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, shaded: &[Vertex]) -> u32 {
         rasterize(registers, memory, resources, Vertices::Shaded(shaded)).unwrap_or(0)
     }
 

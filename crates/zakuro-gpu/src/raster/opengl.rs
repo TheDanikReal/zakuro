@@ -932,4 +932,77 @@ mod tests {
         linear_to_tiled_bytes(&linear, &mut restored, width, height, 4);
         assert_eq!(restored, tiled);
     }
+
+    /// a D24S8 word reaches GL in its packed order, the 24 depth bits low and the
+    /// stencil byte in the top, and the stencil comes back exactly as it went in
+    #[test]
+    fn depth24_stencil_reaches_gl_in_its_word_order() {
+        use crate::format::morton_offset;
+        let (width, height) = (8, 8);
+        let mut tiled = vec![0; (width * height * 4) as usize];
+        let mut sent = vec![0u32; (width * height) as usize];
+        // the guest bytes in tile order, one depth and one stencil per pixel
+        for y in 0..height {
+            for x in 0..width {
+                let depth = ((y * width + x) * 7137) & 0x00FF_FFFF;
+                let stencil = ((y * width + x) * 31) & 0xFF;
+                sent[(y * width + x) as usize] = (stencil << 24) | depth;
+                let at = morton_offset(x, height - 1 - y, width, 4) as usize;
+                tiled[at..at + 4].copy_from_slice(&((stencil << 24) | depth).to_le_bytes());
+            }
+        }
+        let linear = depth_to_linear(&tiled, width, height, 4);
+        for (i, word) in linear.as_chunks::<4>().0.iter().enumerate() {
+            let packed = u32::from_ne_bytes(*word);
+            let word = sent[i];
+            assert_eq!(packed, (word << 8) | (word >> 24), "sample {i} is not in GL's packed order");
+        }
+    }
+
+    /// D24 rides to GL as a float, which holds every 24 bit number but rounds the
+    /// divisions; fed back thru the readback's conversion the samples land within
+    /// one least significant bit, exactly for the ones a float splits evenly
+    #[test]
+    fn depth24_survives_the_float_round_trip() {
+        use crate::format::morton_offset;
+        let (width, height) = (16, 8);
+        let mut tiled = vec![0; (width * height * 3) as usize];
+        let mut sent = vec![0u32; (width * height) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let value = (((y * width + x) * 4099) & 0x00FF_FFFF) as u32;
+                sent[(y * width + x) as usize] = value;
+                let at = morton_offset(x, height - 1 - y, width, 3) as usize;
+                tiled[at..at + 3].copy_from_slice(&value.to_le_bytes()[..3]);
+            }
+        }
+        // the upload, then the readback exactly as sync() does it
+        let linear = depth_to_linear(&tiled, width, height, 3);
+        for (i, word) in linear.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(
+                f32::from_ne_bytes(*word).to_bits(),
+                (sent[i] as f32 / 16_777_215.0).to_bits(),
+                "sample {i} uploaded as a different float",
+            );
+            let back = (f32::from_ne_bytes(*word).clamp(0.0, 1.0) * 16_777_215.0 + 0.5) as u32;
+            let off = back.abs_diff(sent[i]);
+            assert!(
+                off <= 1,
+                "sample {} came back {off} steps off ({} against {})",
+                i,
+                sent[i],
+                back,
+            );
+        }
+        // the halfway-friendly samples, powers of two, come back exact
+        for &value in &[0x800000u32, 0x400000, 0x200000, 1, 0x00FF_FFFF - 1] {
+            let tiled = [(value & 0xFF) as u8, ((value >> 8) & 0xFF) as u8, ((value >> 16) & 0xFF) as u8];
+            let linear = depth_to_linear(&tiled, 1, 1, 3);
+            assert_eq!(linear.len(), 4, "one D24 sample uploads as a float word");
+            let back =
+                (f32::from_ne_bytes(*linear.as_chunks::<4>().0.first().unwrap()) * 16_777_215.0 + 0.5)
+                    as u32;
+            assert_eq!(back, value, "{value:#x} did not survive the float round trip exactly");
+        }
+    }
 }

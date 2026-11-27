@@ -37,3 +37,8 @@ cranelift-frontend = { version = "0.135", optional = true }
 cranelift-jit = { version = "0.135", optional = true }
 cranelift-module = { version = "0.135", optional = true }
 cranelift-native = { version = "0.135", optional = true }
+
+# the OpenGL differential tests load GLX at runtime to build an offscreen
+# software context (llvmpipe), nothing links against X at build time
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11-dl = "2"

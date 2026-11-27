@@ -1259,12 +1259,18 @@ impl OpenGlRasterizer {
                 gl.disable(glow::CULL_FACE);
                 gl.disable(glow::DITHER);
                 gl.disable(glow::FRAMEBUFFER_SRGB);
-                // a guest RGB8 target has no alpha byte to store, so the alpha
-                // channel of the GL's RGBA8 copy keeps the 255 the guest decodes
-                // instead, and no draw may write it: a blend factor reading the
-                // destination alpha then sees the 1.0 the software path sees
-                let alpha_writable =
-                    output.write[3] && target.format != crate::format::ColorFormat::Rgb8;
+                // a guest format that keeps no alpha of its own has the alpha
+                // channel of its RGBA8 copy hold the 255 its decode answers,
+                // and no draw may write it: a blend factor reading the
+                // destination alpha then sees the 1.0 the software path sees.
+                // The 16 bit formats that do keep alpha (RGB5A1 a bit, RGBA4
+                // four) write it thru the copy, and the writeback packs it to
+                // the guest's own precision like the software's encode does
+                let alpha_writable = output.write[3]
+                    && !matches!(
+                        target.format,
+                        crate::format::ColorFormat::Rgb8 | crate::format::ColorFormat::Rgb565
+                    );
                 gl.color_mask(
                     output.write[0],
                     output.write[1],
@@ -2417,6 +2423,49 @@ mod tests {
         let tiled = [0x11, 0x22, 0x33];
         let linear = tiled_to_linear(&tiled, 1, 1, ColorFormat::Rgb8);
         assert_eq!(&linear[..4], &[0x33, 0x22, 0x11, 0xFF]);
+    }
+
+    /// the 16 bit targets pack 2 bytes a texel into their tiles and unpack the
+    /// same texels back out, thru the RGBA rows the GL side holds them in, so
+    /// what a draw leaves resolves into the guest's own bytes
+    #[test]
+    fn tiled_16bit_targets_round_trip_through_linear_gl_rows() {
+        for format in [ColorFormat::Rgb565, ColorFormat::Rgb5A1, ColorFormat::Rgba4] {
+            for (width, height) in [(8, 8), (16, 8), (24, 16)] {
+                let length = (width * height * 2) as usize;
+                let tiled: Vec<u8> = (0..length).map(|i| (i * 61 + 9) as u8).collect();
+                let linear = tiled_to_linear(&tiled, width, height, format);
+                let mut restored = vec![0; length];
+                linear_to_tiled(&linear, &mut restored, width, height, format);
+                assert_eq!(restored, tiled, "{format:?}");
+            }
+        }
+    }
+
+    /// what each 16 bit format's decode answers, the bytes the alpha channel of
+    /// the GL copy holds for a target of it
+    #[test]
+    fn decoded_16bit_pixels_keep_their_own_precision() {
+        // RGB565 keeps no alpha, its decode answers opaque
+        let linear = tiled_to_linear(&[0xFF, 0xFF], 1, 1, ColorFormat::Rgb565);
+        assert_eq!(&linear[..4], &[0xFF, 0xFF, 0xFF, 0xFF]);
+        // RGB5A1 keeps a bit of it
+        let linear = tiled_to_linear(&[0xFF, 0xFF], 1, 1, ColorFormat::Rgb5A1);
+        assert_eq!(&linear[..4], &[0xFF, 0xFF, 0xFF, 0xFF]);
+        let linear = tiled_to_linear(&[0xFE, 0xFF], 1, 1, ColorFormat::Rgb5A1);
+        assert_eq!(&linear[3..4], &[0x00]);
+        // RGBA4 keeps four bits, a stored 4 comes back as 4 times 17
+        let linear = tiled_to_linear(&[0x44, 0x44], 1, 1, ColorFormat::Rgba4);
+        assert_eq!(&linear[..4], &[0x44, 0x44, 0x44, 0x44]);
+        // and a round trip thru the copy's precision lands on the stored value
+        for format in [ColorFormat::Rgb565, ColorFormat::Rgb5A1, ColorFormat::Rgba4] {
+            for value in [[0x00u8, 0x00], [0xFF, 0xFF], [0x21, 0x64], [0xBD, 0x10]] {
+                let linear = tiled_to_linear(&value, 1, 1, format);
+                let mut encoded = [0; 4];
+                format.encode(linear[..4].try_into().expect("RGBA pixel"), &mut encoded);
+                assert_eq!(&encoded[..2], &value, "{format:?}");
+            }
+        }
     }
 
     #[test]

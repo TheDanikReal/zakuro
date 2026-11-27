@@ -3271,7 +3271,10 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             };
             let supported = state.target.buffer_width.is_multiple_of(8)
                 && state.target.buffer_height.is_multiple_of(8)
-                && matches!(state.target.format, ColorFormat::Rgba8 | ColorFormat::Rgb8)
+                && matches!(
+                    state.target.format,
+                    ColorFormat::Rgba8 | ColorFormat::Rgb8 | ColorFormat::Rgb565 | ColorFormat::Rgb5A1 | ColorFormat::Rgba4
+                )
                 && state.proctex.is_none()
                 && texture_setup.is_some()
                 && state.depth_stencil.as_ref().map_or(true, |depth| {

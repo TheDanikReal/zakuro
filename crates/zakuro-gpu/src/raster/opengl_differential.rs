@@ -503,6 +503,18 @@ fn rgb8_image(memory: &CountingMemory) -> Vec<[u8; 3]> {
         .collect()
 }
 
+/// a 16 bit target's texels in window order, the two raw guest bytes a pixel takes
+fn packed_image(memory: &CountingMemory, format: ColorFormat) -> Vec<[u8; 2]> {
+    let bytes_per_pixel = format.bytes_per_pixel() as u32;
+    (0..BUFFER * BUFFER)
+        .map(|sample| {
+            let (x, y) = (sample % BUFFER, sample / BUFFER);
+            let at = (COLOR + morton_offset(x, BUFFER - 1 - y, BUFFER, bytes_per_pixel)) as usize;
+            memory.flat[at..at + 2].try_into().expect("packed pixel")
+        })
+        .collect()
+}
+
 /// the depth buffer's raw samples in window order, a u16/u24/u32 word per pixel
 fn depth_image(memory: &CountingMemory, depth_bytes: u32) -> Vec<u32> {
     (0..BUFFER * BUFFER)
@@ -723,6 +735,84 @@ fn assert_rgb8_close(
     assert!(
         differences.is_empty() && edge_differences <= bound,
         "{what}: {edge_differences} edge pixels differ (bound {bound}) and {} pixels off the \
+         edges do, worst first: {:?}",
+        differences.len(),
+        &differences[..differences.len().min(8)],
+    );
+}
+
+/// the backends left the same 16 bit texels, exactly
+fn assert_packed_identical(cpu: &CountingMemory, gl: &CountingMemory, format: ColorFormat, what: &str) {
+    let (cpu_pixels, gl_pixels) = (packed_image(cpu, format), packed_image(gl, format));
+    let differing: Vec<(u32, u32, [u8; 2], [u8; 2])> = (0..(BUFFER * BUFFER) as usize)
+        .filter(|&index| cpu_pixels[index] != gl_pixels[index])
+        .map(|index| {
+            (
+                index as u32 % BUFFER,
+                index as u32 / BUFFER,
+                cpu_pixels[index],
+                gl_pixels[index],
+            )
+        })
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "{what:?}: {} pixels differ, worst first: {:?}",
+        differing.len(),
+        &differing[..differing.len().min(8)],
+    );
+}
+
+/// interior 16 bit texels agree within `tolerance` a decoded channel, and whatever
+/// else differs sits within a pixel of an edge, in the usual bounded count
+fn assert_packed_close(
+    cpu: &CountingMemory,
+    gl: &CountingMemory,
+    format: ColorFormat,
+    triangles: &[[Screen; 3]],
+    tolerance: u8,
+    what: &str,
+) {
+    let expand = |texel: [u8; 2]| format.decode(&texel);
+    let (cpu_pixels, gl_pixels) = (packed_image(cpu, format), packed_image(gl, format));
+    let mut differences: Vec<(u32, u32, [u8; 4], [u8; 4])> = Vec::new();
+    let mut edge_differences = 0usize;
+    for y in 0..BUFFER {
+        for x in 0..BUFFER {
+            let index = (y * BUFFER + x) as usize;
+            let (cpu_pixel, gl_pixel) = (expand(cpu_pixels[index]), expand(gl_pixels[index]));
+            let off = cpu_pixel
+                .iter()
+                .zip(gl_pixel.iter())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            if off <= tolerance {
+                continue;
+            }
+            if edge_distance(x, y, triangles) <= 1.0 {
+                edge_differences += 1;
+            } else {
+                differences.push((x, y, cpu_pixel, gl_pixel));
+            }
+        }
+    }
+    let perimeter: f32 = triangles
+        .iter()
+        .map(|triangle| {
+            (0..3)
+                .map(|i| {
+                    let a = &triangle[i];
+                    let b = &triangle[(i + 1) % 3];
+                    (b.x - a.x).hypot(b.y - a.y)
+                })
+                .sum::<f32>()
+        })
+        .sum();
+    let bound = perimeter.ceil() as usize * 2 + 16;
+    assert!(
+        differences.is_empty() && edge_differences <= bound,
+        "{what:?}: {edge_differences} edge pixels differ (bound {bound}) and {} pixels off the \
          edges do, worst first: {:?}",
         differences.len(),
         &differences[..differences.len().min(8)],
@@ -2777,8 +2867,9 @@ fn opengl_texture_cache_reuse_invalidation_and_eviction() {
         }
     }
 }
-/// a draw the OpenGL path cannot take — a logic op, a 16 bit target, a blend
-/// factor GL lacks or procedural textures — falls back to the CPU rasterizer
+/// a draw the OpenGL path cannot take — a logic op, a depth buffer over its own
+/// color target, a blend factor GL lacks or procedural textures — falls back to
+/// the CPU rasterizer
 /// after syncing what the GL drew, and the bytes match a run that never saw the
 /// GL at all. Fragment lighting, the fog and RGB8 targets used to be on this
 /// list; they draw in the GL now, and their tests are differentials of their own.
@@ -2792,8 +2883,11 @@ fn opengl_unsupported_draws_fall_back_after_syncing_and_match_the_cpu() {
             registers[REG_COLOR_OPERATION] = 0;
             registers[REG_LOGIC_OP] = 6; // XOR, not the copy that reads as none
         }),
-        ("an RGB565 target", |registers| {
-            registers[REG_COLOR_BUFFER_FORMAT] = 3 << 16;
+        ("a depth buffer over its own color target", |registers| {
+            // the GL path refuses a target whose depth shares its color bytes,
+            // the software fills both from the same memory in order
+            registers[REG_DEPTH_COLOR_MASK] = 0xF << 8 | 1 << 12; // the depth test on and writing
+            registers[REG_DEPTH_BUFFER_ADDRESS] = (COLOR + 256) >> 3;
         }),
         ("a blend factor GL lacks", |registers| {
             // GL takes the source alpha saturate factor as the color side's
@@ -3455,6 +3549,155 @@ fn opengl_rgb8_targets_match_the_cpu() {
         rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
         resolve(&mut resources, &mut gl, 0);
         assert_rgb8_identical(&cpu, &gl, "sampling an RGB8 target as a texture");
+    }
+}
+
+/// the 16 bit color targets draw, blend, mask and sample back like the CPU does,
+/// each keeping the RGBA8 copy the GL path holds every target in
+#[test]
+fn opengl_16bit_targets_match_the_cpu() {
+    // the color buffer numbers the format register takes, and the texture
+    // format's own, which number 565 and 5551 the other way around
+    for (raw, texture_raw, format) in [
+        (2u32, 3u32, ColorFormat::Rgb5A1),
+        (3, 2, ColorFormat::Rgb565),
+        (4, 4, ColorFormat::Rgba4),
+    ] {
+        let viewport = (0.0, 0.0, 16.0, 16.0);
+        // a plain cover, then a slanted triangle over it
+        {
+            let Some(mut resources) = opengl_resources() else {
+                return;
+            };
+            let mut registers = registers(0);
+            registers[REG_COLOR_BUFFER_FORMAT] = raw << 16;
+            let mut cpu = CountingMemory::zeroed(0x1_0000);
+            let mut gl = CountingMemory::zeroed(0x1_0000);
+            rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &cover(viewport, -0.5, FLAT));
+            rasterize_shaded(&registers, &mut gl, &mut resources, &cover(viewport, -0.5, FLAT));
+            let quad = slanted([OTHER, OTHER, OTHER], [1.2, 0.8, 1.0], -0.4);
+            rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+            rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+            resolve(&mut resources, &mut gl, 0);
+            assert_packed_identical(&cpu, &gl, format, &format!("{format:?}: covers and a slanted triangle"));
+        }
+        // interpolated colors over the whole target, the writeback packing each
+        // pixel to the format's own precision on both sides
+        {
+            let Some(mut resources) = opengl_resources() else {
+                return;
+            };
+            let mut registers = registers(0);
+            registers[REG_COLOR_BUFFER_FORMAT] = raw << 16;
+            let mut cpu = CountingMemory::zeroed(0x1_0000);
+            let mut gl = CountingMemory::zeroed(0x1_0000);
+            let quad = slanted(
+                [
+                    [0.9, 0.1, 0.3, 0.8].into(),
+                    [0.2, 0.8, 0.6, 0.3].into(),
+                    [0.5, 0.4, 0.9, 0.6].into(),
+                ],
+                [1.3, 0.7, 1.1],
+                -0.4,
+            );
+            let placed = placed_triangles(&registers, &quad);
+            rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+            rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+            resolve(&mut resources, &mut gl, 0);
+            // one step of the widest channel: a byte of float noise crossing a
+            // 5/6/4 bit bucket moves the stored value that far
+            assert_packed_close(&cpu, &gl, format, &placed, 8, &format!("{format:?}: interpolated colors"));
+        }
+        // a transparency blend over a base, the factors reading only the source,
+        // so the copy's precision never enters the math
+        {
+            let Some(mut resources) = opengl_resources() else {
+                return;
+            };
+            let mut plain = registers(0);
+            plain[REG_COLOR_BUFFER_FORMAT] = raw << 16;
+            let mut blended = plain.clone();
+            blended[REG_COLOR_OPERATION] = 0x100;
+            blended[REG_BLEND_FUNC] = blend_func((0, 6, 7), (0, 1, 0));
+            let mut cpu = CountingMemory::zeroed(0x1_0000);
+            let mut gl = CountingMemory::zeroed(0x1_0000);
+            let base = cover(viewport, -0.5, FLAT);
+            rasterize_shaded(&plain, &mut cpu, &mut Resources::default(), &base);
+            rasterize_shaded(&plain, &mut gl, &mut resources, &base);
+            let quad = slanted([OTHER, OTHER, OTHER], [1.0, 1.0, 1.0], -0.4);
+            rasterize_shaded(&blended, &mut cpu, &mut Resources::default(), &quad);
+            rasterize_shaded(&blended, &mut gl, &mut resources, &quad);
+            resolve(&mut resources, &mut gl, 0);
+            assert_packed_identical(&cpu, &gl, format, &format!("{format:?}: a transparency blend"));
+        }
+        // a blend reading the destination, where the GL copy holds the
+        // pipeline's own 8 bits while the software reads the format's expanded
+        // bytes back — bounded at the spread between the two plus the encode's
+        // own step
+        {
+            let Some(mut resources) = opengl_resources() else {
+                return;
+            };
+            let mut plain = registers(0);
+            plain[REG_COLOR_BUFFER_FORMAT] = raw << 16;
+            let mut blended = plain.clone();
+            blended[REG_COLOR_OPERATION] = 0x100;
+            blended[REG_BLEND_FUNC] = blend_func((0, 2, 4), (0, 1, 0));
+            let mut cpu = CountingMemory::zeroed(0x1_0000);
+            let mut gl = CountingMemory::zeroed(0x1_0000);
+            let base = cover(viewport, -0.5, FLAT);
+            rasterize_shaded(&plain, &mut cpu, &mut Resources::default(), &base);
+            rasterize_shaded(&plain, &mut gl, &mut resources, &base);
+            let quad = slanted([OTHER, OTHER, OTHER], [1.0, 1.0, 1.0], -0.4);
+            let placed = placed_triangles(&blended, &quad);
+            rasterize_shaded(&blended, &mut cpu, &mut Resources::default(), &quad);
+            rasterize_shaded(&blended, &mut gl, &mut resources, &quad);
+            resolve(&mut resources, &mut gl, 0);
+            assert_packed_close(&cpu, &gl, format, &placed, 6, &format!("{format:?}: a destination blend"));
+        }
+        // a partial color mask keeps the channels it may not change
+        {
+            let Some(mut resources) = opengl_resources() else {
+                return;
+            };
+            let mut masked = registers(0);
+            masked[REG_COLOR_BUFFER_FORMAT] = raw << 16;
+            masked[REG_DEPTH_COLOR_MASK] = 0x7 << 8; // red and green only
+            let mut cpu = CountingMemory::zeroed(0x1_0000);
+            let mut gl = CountingMemory::zeroed(0x1_0000);
+            let base = cover(viewport, -0.5, FLAT);
+            rasterize_shaded(&registers(0), &mut cpu, &mut Resources::default(), &base);
+            rasterize_shaded(&registers(0), &mut gl, &mut resources, &base);
+            let quad = cover(viewport, -0.4, OTHER);
+            rasterize_shaded(&masked, &mut cpu, &mut Resources::default(), &quad);
+            rasterize_shaded(&masked, &mut gl, &mut resources, &quad);
+            resolve(&mut resources, &mut gl, 0);
+            assert_packed_identical(&cpu, &gl, format, &format!("{format:?}: a partial color mask"));
+        }
+        // what the GL holds resolves into the guest's own 2 byte tiles, so a
+        // later draw reading the target as a texture sees the same texels
+        {
+            let Some(mut resources) = opengl_resources() else {
+                return;
+            };
+            let mut registers = registers(0);
+            registers[REG_COLOR_BUFFER_FORMAT] = raw << 16;
+            let mut cpu = CountingMemory::zeroed(0x1_0000);
+            let mut gl = CountingMemory::zeroed(0x1_0000);
+            rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &cover(viewport, -0.5, FLAT));
+            rasterize_shaded(&registers, &mut gl, &mut resources, &cover(viewport, -0.5, FLAT));
+            registers[REG_TEXTURE_CONFIG] = 1;
+            registers[TEXTURE_UNIT_BASES[0] + 1] = 16 | (16 << 16);
+            registers[TEXTURE_UNIT_BASES[0] + 4] = COLOR >> 3;
+            registers[TEXTURE_UNIT_BASES[0] + 13] = texture_raw;
+            tev_stage(&mut registers, 0, [3, 0, 0], [3, 0, 0], [0; 3], [0; 3], 0, 0, 0);
+            tev_passthrough(&mut registers, &[0]);
+            let quad = uv_quad(viewport, &[(&0, 0.0, 0.0, 1.0, 1.0)]);
+            rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+            rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+            resolve(&mut resources, &mut gl, 0);
+            assert_packed_identical(&cpu, &gl, format, &format!("{format:?}: sampled back as a texture"));
+        }
     }
 }
 

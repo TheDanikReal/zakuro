@@ -1,20 +1,22 @@
 # OpenGL rasterizer TODO
 
-The current MVP only rasterizes untextured, vertex-colored triangles. Unsupported draws use Zakuro's complete CPU rasterizer.
+The OpenGL path rasterizes vertex-colored, textured triangles running the full six-stage texture environment in one uber-shader. Unsupported draws use Zakuro's complete CPU rasterizer.
 
 Not implemented in the OpenGL path:
 
 - PICA vertex shaders and geometry shaders on the GPU; vertex processing, clipping, and culling still run on the CPU.
-- Texture sampling, mipmaps, texture replacement, and non-passthrough texture-environment (TEV) combiners.
-- Fragment lighting, procedural textures, and fog.
+- Fragment lighting, procedural textures, and fog. A combiner reading the fragment lighting colors also stays on the CPU (it answers them defensively as primary and black if lighting is off, matching `TexEnv::apply`, but a draw with lighting enabled never reaches the GL).
+- Texture replacement: a texture pack's pictures take no part in the GL path yet, draws sample the decoded guest texels.
 - Logic operations, which stay on the CPU: the OpenGL binding does not wrap glLogicOp, so the GL path has no way to set one. OpenGL depth/stencil still supports D16, D24, and D24S8 only when the color path is otherwise supported.
-- Framebuffer formats other than RGBA8 and dimensions that are not multiples of 8.
+- Framebuffer formats other than RGBA8 and dimensions that are not multiples of 8. (Texture dimensions have no such limit: uploads are ordinary RGBA rows of any size.)
 - Resolution scaling, direct GPU presentation, and frame interpolation.
 - Full-range synchronization is used for an overlapping target; finer dirty tile/rectangle tracking could reduce writeback cost for sparse draws.
-- The render-target cache is bounded by its 128 MiB budget with least-recently-used eviction, each victim resolved into guest memory before its GL objects are destroyed, so long sessions with many distinct targets stay bounded; only destruction itself is untested on real hardware.
+- The render-target cache is bounded by its 128 MiB budget with least-recently-used eviction, each victim resolved into guest memory before its GL objects are destroyed, so long sessions with many distinct targets stay bounded; only destruction itself is untested on real hardware. The decoded-texture cache runs the same way under a 64 MiB budget.
 - Direct GPU display transfer/presentation is not implemented, so transfers and scanout still synchronize to guest memory.
 - Partial overlap and aliasing between differently sized color/depth views remain conservative: synchronization resolves full cached attachments, and unusual overlapping views should be covered by additional integration cases.
 - OpenGL depth/stencil readback depends on driver support for the selected packed depth formats; unsupported/incomplete FBOs fall back to the CPU path.
+- Texture sampling whose coordinates land exactly on a texel boundary can answer one texel apart from the CPU: both sides floor the same float, but the coordinate reaches them through different rounding (the CPU's barycentric weights versus GL's interpolated varyings). The differential tests keep pixel centers inside texels so the answer is never in doubt; titles texturing at exact boundaries may see a one-texel disagreement on the seam.
+- The combiner's Dot3 operations sum their products in GLSL's `dot()`, which may fuse differently than the software path's channel-by-channel sum; the differential tests bound that at one byte of rounding, and interpolated combiner results may wobble the same one step.
 
 # Differential test coverage
 
@@ -25,8 +27,15 @@ Not implemented in the OpenGL path:
 - Stencil: every stencil operation (keep, zero, replace, increment/decrement, invert, wrapping) in all three outcomes (stencil fail, depth fail, both passing), with partial compare and write masks, checked against the byte the state alone dictates.
 - Depth mapping: z-buffer and w-buffer modes with scales and offsets that land in range and ones that clamp, over a slanted triangle with varying w.
 - Output merger: the alpha test's eight compare functions over a flat alpha that passes and refuses as the reference dictates, plus one over a slanted triangle whose alpha slides across the reference, where the backends may split only on the reference's own byte; every blend equation and factor pairing GL takes (standard transparency, additive, subtract and reverse subtract, min and max, constant factors, the source alpha saturate, a separate alpha equation), the blended alpha channel included; partial color masks over a base quad, the masked channels holding what was under them, including a draw that may write nothing at all; and the merger whole — blending, an alpha test and a partial mask over a depth testing, stencil writing draw — once refused and once passed by the alpha.
+- Texture formats: RGBA8, RGB8, RGBA5551, RGB565, RGBA4, LA8, HILO8, L8, A8, LA4, L4 and A4 laid down Morton tiled in their own byte orders, plus ETC1 and ETC1A4 as raw blocks, all sampled byte-for-byte identically through Zakuro's CPU decoder.
+- Wrapping: all sixteen wrap-mode pairs over coordinates hanging off every side of the texture, byte-exact, with a border clamp answering the unit's border color.
+- Filtering: bilinear magnification and minification land between texels within one byte on both sides.
+- Level of detail: a three-level texture answers its own size's color at spans that land on level 0, 1 and 2, halfway takes the bigger level, a bias of minus one moves the level, and the two-level blend mixes the same on both sides.
+- Combiners: every operation (replace, modulate, add, add signed, lerp, subtract, dot3 rgb and rgba, multiply add, add multiply) over texture, constant and vertex-color sources within a byte; the combiner buffer handing stage 0's result to stage 2 with the buffer's own color in between, color and alpha updating separately, and the output scale doubling.
+- Units: two units modulating in one draw each on its own coordinate set, unit 2 reading coordinate set 1, and a projected unit 0 dividing by set 0's w.
+- Texture cache: a texture decoded once rides its GL upload across draws without a second read of guest memory; bytes written over it between command lists decode and upload again; a budget of a couple of textures (limit_texture_cache) turns them over with the pixels staying right; and a draw sampling a texture that overlaps the target the last GL draw still holds sees what that draw left, resolved into guest memory first.
 - Cache eviction: the tests turn the surface budget down to a couple of targets (`limit_surface_cache`), the third distinct target resolves the first into guest memory with the bytes the CPU's run holds, and a later draw to it uploads what was resolved instead of pretending it stayed resident.
-- Lazy FBO caching: consecutive draws leave the target resident (one upload, no readbacks, CPU reads/writes guarded); explicit sync and the `sync_memory`/`sync_depth` hooks resolve and invalidate; memory fills and display transfers take the drawn pixels first; overlapping and aliased color/depth targets resolve each other; unsupported states (logic ops, a texture drawn into, a non-RGBA8 target, a blend factor GL lacks) fall back after syncing, byte-identical to a CPU-only run.
+- Lazy FBO caching: consecutive draws leave the target resident (one upload, no readbacks, CPU reads/writes guarded); explicit sync and the `sync_memory`/`sync_depth` hooks resolve and invalidate; memory fills and display transfers take the drawn pixels first; overlapping and aliased color/depth targets resolve each other; unsupported states (logic ops, fog, procedural textures, fragment lighting, a non-RGBA8 target, a blend factor GL lacks) fall back after syncing, byte-identical to a CPU-only run.
 - Full-path: a draw through a real command list (vertex shader, attribute arrays, `process_command_list`) with the OpenGL renderer attached matches the CPU run, and its display transfer converts the same pixels.
 - Tiled conversions (pure unit tests in `raster/opengl.rs`, run everywhere): RGBA8, D16 and D24S8 round trips, the D24S8 packed GL word order with the stencil byte exact, and the D24 float round trip within one least significant bit.
 
@@ -35,10 +44,12 @@ Running them: the GL-dependent tests need an OpenGL 4.3 context. Headless Linux 
 Findings and deferred cases:
 
 - Fragments testing exactly at a stored depth sample are deliberately left out: the CPU compares the fragment's float against the float of the stored word while the GL quantizes the fragment into the buffer first, so at the sample itself the two can answer interpolated pixels' float noise differently (observed up to half a D24 target). The tests keep an eight-LSB margin where the compare functions' answers are unambiguous. Games relying on exact-equal depth (shadow volumes) may see the GL path judge boundary fragments differently than the CPU did.
+- Texture coordinates landing exactly on a texel boundary (see above) are kept out of the tests the same way: the quads the texture tests draw put every pixel center inside a texel, where a rounding step cannot change the answer.
 - The CPU rasterizer itself panics filling a target whose width is not a whole number of tiles: the spill tile of the last row of tiles is cut off the copy in `Surface::load` and `Band::at` indexes past it. Titles only draw into tile-aligned buffers so it never shows, and the GL path skips unaligned dimensions anyway; the ignored `cpu_draws_survive_an_unaligned_target_width` regression test is ready when it is fixed.
 - A depth-only sync (`Gpu::sync_depth`) also writes back the color surface of any cached key it touches, because a selected key resolves color and depth together. Conservative rather than wrong; finer per-plane dirty tracking could avoid the extra writeback.
-- Cache eviction is covered with a test-only budget (`limit_surface_cache` in the OpenGL rasterizer turns the 128 MiB down to a couple of targets); the real budget runs the same code at a different number, and exercising it for real would still need thousands of distinct targets.
-- Where a missing feature lands, the fallback tests extend to it, as they did when the alpha test, blending and partial color masks accelerated: the draws they once used to pin the fallback became the acceleration differentials.
+- Cache eviction is covered with test-only budgets (`limit_surface_cache` and `limit_texture_cache` in the OpenGL rasterizer turn the real budgets down to a couple of entries); the real budgets run the same code at different numbers, and exercising them for real would still need thousands of distinct targets and textures.
+- The decoded-texture cache keys each GL texture on the allocation the CPU decoder handed out, so its invalidation is exactly the CPU texture cache's: a `checked` or `unchanged` texture keeps its GL copy, a re-decoded one uploads again. The draw-overlapping-target case is recorded by the CPU cache's write tracking; fills and transfers reach it through the memory watch across command lists. A texture changed and restored within one command list without an intervening draw is the one blind spot, shared with the CPU cache itself.
+- Where a missing feature lands, the fallback tests extend to it, as they did when the alpha test, blending and partial color masks accelerated, and again when texturing did: the draws that once pinned the texture fallback became the texture differentials.
 - Logic operations are the one output-merger piece still handed to the CPU: glow does not wrap glLogicOp, and OpenGL 4.3 offers no other way to read the destination in place, so a draw in logic-op mode falls back after syncing (pinned by the fallback test) until the binding grows the call.
 
 # Next work

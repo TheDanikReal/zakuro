@@ -1843,25 +1843,866 @@ fn opengl_sync_resolves_and_invalidates() {
     );
 }
 
-/// a draw the OpenGL path cannot take — a logic op, a bound texture, a non-RGBA8
-/// target, a blend factor GL lacks — falls back to the CPU rasterizer after
-/// syncing what the GL drew, and the bytes match a run that never saw the GL at all
+/// the textured quad the render-to-texture test draws, cover() w/ the texture
+/// environment passing the vertex color thru
+fn textured_draw(registers: &mut Vec<u32>, memory: &mut CountingMemory, resources: &mut Resources) {
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    let quad: Vec<Vertex> = cover(viewport, -0.75, OTHER);
+    rasterize_shaded(registers, memory, resources, &quad);
+}
+
+/// a textured draw matches the CPU, including the render-to-texture order: a
+/// texture that overlaps the target the last GL draw still holds samples what
+/// that draw left, resolved into guest memory before the decode
+#[test]
+fn opengl_textured_draws_match_the_cpu() {
+    let Some(mut resources) = opengl_resources() else {
+        return;
+    };
+    let mut registers = registers(0);
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    let mut cpu = CountingMemory::zeroed(0x1_0000);
+    let mut gl = CountingMemory::zeroed(0x1_0000);
+    // first a plain draw the GL keeps resident
+    let first = cover(viewport, -0.5, FLAT);
+    rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &first);
+    rasterize_shaded(&registers, &mut gl, &mut resources, &first);
+    // then the texture registers arrive and the draw samples what it sits on
+    registers[REG_TEXTURE_CONFIG] = 1;
+    registers[TEXTURE_UNIT_BASES[0] + 1] = 8 | (8 << 16);
+    registers[TEXTURE_UNIT_BASES[0] + 4] = COLOR >> 3;
+    registers[TEXTURE_UNIT_BASES[0] + 13] = 0; // RGBA8
+    textured_draw(&mut registers, &mut cpu, &mut Resources::default());
+    textured_draw(&mut registers, &mut gl, &mut resources);
+    resolve(&mut resources, &mut gl, 0);
+    assert_images_identical(&cpu, &gl, "a draw sampling its own target");
+}
+
+// ---------------------------------------------------------------------------
+// texture formats, wrap modes, filtering, mipmaps and the combiners
+// ---------------------------------------------------------------------------
+
+/// the address the texture tests lay their texture at, past the target and its
+/// depth buffer
+const TEXTURE: u32 = 0x5000;
+/// the second texture's address
+const OTHER_TEXTURE: u32 = 0x6000;
+
+/// where each combiner stage's five registers start, the same list `tev.rs` runs on
+const TEV_STAGES: [usize; 6] = [0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8];
+/// the register holding which stages write the combiner buffer
+const TEV_UPDATE_BUFFER: usize = 0x0E0;
+/// the register holding the combiner buffer's initial color
+const TEV_BUFFER_COLOR: usize = 0x0FD;
+
+/// a deterministic byte per index, so every test lays the same texture down
+fn pattern_byte(index: usize) -> u8 {
+    let mut word = (index as u32).wrapping_mul(0x9E37_79B9) ^ 0x1234_5678;
+    word ^= word << 13;
+    word ^= word >> 17;
+    word ^= word << 5;
+    word as u8
+}
+
+/// scatters a texture's linear texel bytes over its guest memory, Morton tiled
+/// the way an uncompressed texture sits in it. The texels run one row after
+/// another from the top, each in the format's own bytes, the byte order
+/// `decode_bytes` reads back
+fn tiled_texture(texels: &[u8], raw_format: u32, width: u32, height: u32) -> Vec<u8> {
+    let format = crate::texture::TextureFormat::from_raw(raw_format);
+    let bits = format.bits_per_pixel();
+    let bytes_per_texel = (bits / 8).max(1) as usize;
+    let mut tiled = vec![0u8; texture_bytes(format, width, height, 1)];
+    for y in 0..height {
+        for x in 0..width {
+            let source = ((y * width + x) as usize) * bytes_per_texel;
+            if bits >= 8 {
+                let at = morton_offset(x, y, width, bits / 8) as usize;
+                tiled[at..at + bytes_per_texel]
+                    .copy_from_slice(&texels[source..source + bytes_per_texel]);
+            } else {
+                // a nibble a texel, the low nibble first
+                let at = morton_offset(x, y, width, bits) as usize;
+                let value = texels[source];
+                if at.is_multiple_of(8) {
+                    tiled[at / 8] = (tiled[at / 8] & 0xF0) | (value & 0x0F);
+                } else {
+                    tiled[at / 8] = (tiled[at / 8] & 0x0F) | (value << 4);
+                }
+            }
+        }
+    }
+    tiled
+}
+
+/// lays a texture of `texels` down in a test's memory, every level of it
+fn lay_texture(
+    memory: &mut CountingMemory,
+    addr: u32,
+    texels: &[u8],
+    raw_format: u32,
+    width: u32,
+    height: u32,
+    levels: u32,
+) {
+    let format = crate::texture::TextureFormat::from_raw(raw_format);
+    let bytes_per_texel = (format.bits_per_pixel() / 8).max(1) as usize;
+    let mut offset = 0usize;
+    for level in 0..levels {
+        let (w, h) = (width >> level, height >> level);
+        let count = (w * h) as usize * bytes_per_texel;
+        let tiled = tiled_texture(&texels[offset..offset + count], raw_format, w, h);
+        let at = (addr + texture_bytes(format, width, height, level) as u32) as usize;
+        memory.flat[at..at + tiled.len()].copy_from_slice(&tiled);
+        offset += count;
+    }
+}
+
+/// points texture unit `unit` at a texture at `addr`, w/ the unit config and
+/// level of detail words the registers hold
+fn bind_texture_unit(
+    registers: &mut [u32],
+    unit: usize,
+    addr: u32,
+    width: u32,
+    height: u32,
+    raw_format: u32,
+    config: u32,
+    lod: u32,
+) {
+    registers[REG_TEXTURE_CONFIG] |= 1 << unit;
+    let base = TEXTURE_UNIT_BASES[unit];
+    registers[base + 1] = height | (width << 16);
+    registers[base + 2] = config;
+    registers[base + 3] = lod;
+    registers[base + 4] = addr >> 3;
+    if unit == 0 {
+        registers[base + 13] = raw_format;
+    } else {
+        registers[base + 5] = raw_format;
+    }
+}
+
+/// sets one combiner stage from the fields, by the register numbers the PICA
+/// packs them by
+#[allow(clippy::too_many_arguments)]
+fn tev_stage(
+    registers: &mut [u32],
+    stage: usize,
+    color_sources: [u32; 3],
+    alpha_sources: [u32; 3],
+    color_operands: [u32; 3],
+    alpha_operands: [u32; 3],
+    ops: u32,
+    constant: u32,
+    scale: u32,
+) {
+    let base = TEV_STAGES[stage];
+    registers[base] = color_sources[0]
+        | (color_sources[1] << 4)
+        | (color_sources[2] << 8)
+        | (alpha_sources[0] << 16)
+        | (alpha_sources[1] << 20)
+        | (alpha_sources[2] << 24);
+    registers[base + 1] = color_operands[0]
+        | (color_operands[1] << 4)
+        | (color_operands[2] << 8)
+        | (alpha_operands[0] << 12)
+        | (alpha_operands[1] << 16)
+        | (alpha_operands[2] << 20);
+    registers[base + 2] = ops;
+    registers[base + 3] = constant;
+    registers[base + 4] = scale;
+}
+
+/// every stage but the given one hands the previous result on untouched
+fn tev_passthrough(registers: &mut [u32], except: &[usize]) {
+    for (stage, base) in TEV_STAGES.iter().enumerate() {
+        if !except.contains(&stage) {
+            registers[*base] = 0x000F_000F;
+        }
+    }
+}
+
+/// a quad exactly over the target whose texture coordinates on the named sets
+/// run from (u0, v0) at the bottom left to (u1, v1) at the top right. The
+/// corners sit on the viewport's own edges, so every pixel center's coordinates
+/// land inside a texel, never on the boundary a rounding step would cross
+fn uv_quad(viewport: (f32, f32, f32, f32), spans: &[(&usize, f32, f32, f32, f32)]) -> Vec<Vertex> {
+    let (vx, vy, vw, vh) = viewport;
+    let (u0, v0, u1, v1) = spans
+        .first()
+        .map_or((0.0, 0.0, 1.0, 1.0), |&(_, u0, v0, u1, v1)| {
+            (u0, v0, u1, v1)
+        });
+    let mut vertices = Vec::with_capacity(6);
+    for triangle in [
+        [
+            (vx, vy, u0, v0),
+            (vx + vw, vy, u1, v0),
+            (vx + vw, vy + vh, u1, v1),
+        ],
+        [
+            (vx, vy, u0, v0),
+            (vx + vw, vy + vh, u1, v1),
+            (vx, vy + vh, u0, v1),
+        ],
+    ] {
+        vertices.extend(triangle.map(|(x, y, u, v)| {
+            let mut vertex = corner_at(viewport, x, y, -0.5, 1.0, FLAT);
+            for (set, span_u0, span_v0, span_u1, span_v1) in spans.iter() {
+                let t = (u - span_u0) / (span_u1 - span_u0);
+                let s = (v - span_v0) / (span_v1 - span_v0);
+                vertex.texcoords[**set] = [t, s];
+            }
+            vertex
+        }));
+    }
+    vertices
+}
+
+/// every texture format decodes the same guest bytes into both backends'
+/// samples, Zakuro's own decoder feeding each its texels
+#[test]
+fn opengl_texture_formats_match_the_cpu() {
+    // (the format's raw number, bytes a texel takes in memory, a name)
+    let formats = [
+        (0u32, 4usize, "RGBA8"),
+        (1, 3, "RGB8"),
+        (2, 2, "RGBA5551"),
+        (3, 2, "RGB565"),
+        (4, 2, "RGBA4"),
+        (5, 2, "LA8"),
+        (6, 2, "HILO8"),
+        (7, 1, "L8"),
+        (8, 1, "A8"),
+        (9, 1, "LA4"),
+        (10, 1, "L4"),
+        (11, 1, "A4"),
+    ];
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    for (raw, bytes_per_texel, name) in formats {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        // an 8x8 texture of every byte value the format's texels hold
+        let texels: Vec<u8> = (0..64 * bytes_per_texel).map(pattern_byte).collect();
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        lay_texture(&mut cpu, TEXTURE, &texels, raw, 8, 8, 1);
+        lay_texture(&mut gl, TEXTURE, &texels, raw, 8, 8, 1);
+        bind_texture_unit(&mut registers, 0, TEXTURE, 8, 8, raw, 0, 0);
+        // one combiner stage taking the sample straight thru
+        tev_stage(
+            &mut registers,
+            0,
+            [3, 3, 3],
+            [3, 3, 3],
+            [0; 3],
+            [0; 3],
+            0,
+            0,
+            0,
+        );
+        tev_passthrough(&mut registers, &[0]);
+        let quad = uv_quad(viewport, &[(&0, 0.0, 0.0, 1.0, 1.0)]);
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_identical(&cpu, &gl, &format!("{name} samples the same"));
+    }
+    // the compressed formats, raw blocks of every bit pattern the decoder reads
+    for (raw, block_bytes, name) in [(12u32, 8usize, "ETC1"), (13, 16, "ETC1A4")] {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        // an 8x8 texture is one 8x8 tile of four 4x4 blocks, laid out in order
+        let raw_blocks: Vec<u8> = (0..4 * block_bytes).map(pattern_byte).collect();
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        let at = TEXTURE as usize;
+        cpu.flat[at..at + raw_blocks.len()].copy_from_slice(&raw_blocks);
+        gl.flat[at..at + raw_blocks.len()].copy_from_slice(&raw_blocks);
+        bind_texture_unit(&mut registers, 0, TEXTURE, 8, 8, raw, 0, 0);
+        tev_stage(
+            &mut registers,
+            0,
+            [3, 3, 3],
+            [3, 3, 3],
+            [0; 3],
+            [0; 3],
+            0,
+            0,
+            0,
+        );
+        tev_passthrough(&mut registers, &[0]);
+        let quad = uv_quad(viewport, &[(&0, 0.0, 0.0, 1.0, 1.0)]);
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_identical(&cpu, &gl, &format!("{name} samples the same"));
+    }
+}
+
+/// wrap modes wrap the same texels on both sides, over coordinates hanging off
+/// every side of the texture, and a border clamp answers the unit's border color
+#[test]
+fn opengl_wrap_modes_and_border_colors_match_the_cpu() {
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    let texels: Vec<u8> = (0..64 * 4).map(pattern_byte).collect();
+    for wrap_s in 0..4u32 {
+        for wrap_t in 0..4u32 {
+            let Some(mut resources) = opengl_resources() else {
+                return;
+            };
+            let mut registers = registers(0);
+            let mut cpu = CountingMemory::zeroed(0x1_0000);
+            let mut gl = CountingMemory::zeroed(0x1_0000);
+            lay_texture(&mut cpu, TEXTURE, &texels, 0, 8, 8, 1);
+            lay_texture(&mut gl, TEXTURE, &texels, 0, 8, 8, 1);
+            bind_texture_unit(
+                &mut registers,
+                0,
+                TEXTURE,
+                8,
+                8,
+                0,
+                (wrap_t << 8) | (wrap_s << 12),
+                0,
+            );
+            // a border color nothing else in the image answers
+            registers[TEXTURE_UNIT_BASES[0]] = 0x4080_C020; // red 0x20, green 0xC0, blue 0x80, alpha 0x40
+            tev_stage(
+                &mut registers,
+                0,
+                [3, 3, 3],
+                [3, 3, 3],
+                [0; 3],
+                [0; 3],
+                0,
+                0,
+                0,
+            );
+            tev_passthrough(&mut registers, &[0]);
+            let quad = uv_quad(viewport, &[(&0, -0.25, -0.25, 1.25, 1.25)]);
+            rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+            rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+            resolve(&mut resources, &mut gl, 0);
+            assert_images_identical(&cpu, &gl, &format!("wrap s{wrap_s} t{wrap_t}"));
+        }
+    }
+}
+
+/// bilinear filtering lands between texels the same way on both sides,
+/// magnifying and minifying
+#[test]
+fn opengl_linear_filtering_matches_the_cpu() {
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    let texels: Vec<u8> = (0..64 * 4).map(pattern_byte).collect();
+    for (config, span, what) in [
+        (2u32, (0.0f32, 0.0, 1.0, 1.0), "magnifying"), // bit 1, linear when magnifying
+        (4, (0.0, 0.0, 1.0, 1.0), "minifying"),        // bit 2, linear when minifying
+    ] {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        lay_texture(&mut cpu, TEXTURE, &texels, 0, 8, 8, 1);
+        lay_texture(&mut gl, TEXTURE, &texels, 0, 8, 8, 1);
+        bind_texture_unit(&mut registers, 0, TEXTURE, 8, 8, 0, config, 0);
+        tev_stage(
+            &mut registers,
+            0,
+            [3, 3, 3],
+            [3, 3, 3],
+            [0; 3],
+            [0; 3],
+            0,
+            0,
+            0,
+        );
+        tev_passthrough(&mut registers, &[0]);
+        let quad = uv_quad(viewport, &[(&0, span.0, span.1, span.2, span.3)]);
+        let placed = placed_triangles(&registers, &quad);
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_close(&cpu, &gl, &placed, 1, &format!("bilinear {what}"));
+    }
+}
+
+/// the level of detail the coordinate rate picks is the level both sides
+/// sample: a 32x32 texture of three flat sizes answers its own color at each
+/// span, a bias moves the level, and blending the two levels about the level
+/// blends the same on both sides
+#[test]
+fn opengl_mipmap_levels_match_the_cpu() {
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    // three sizes, each flat: red, green and blue as the decoder reads the bytes
+    let mut texels = vec![0u8; (32 * 32 + 16 * 16 + 8 * 8) * 4];
+    for texel in texels[..32 * 32 * 4].chunks_mut(4) {
+        texel.copy_from_slice(&[255, 0, 0, 255]);
+    }
+    for texel in texels[32 * 32 * 4..32 * 32 * 4 + 16 * 16 * 4].chunks_mut(4) {
+        texel.copy_from_slice(&[255, 0, 255, 0]); // decodes to green
+    }
+    for texel in texels[32 * 32 * 4 + 16 * 16 * 4..].chunks_mut(4) {
+        texel.copy_from_slice(&[255, 255, 0, 0]); // decodes to blue
+    }
+    let red = [255u8, 0, 0, 255];
+    let green = [255u8, 0, 255, 0];
+    let blue = [255u8, 255, 0, 0];
+    let mixed = [255u8, 127, 127, 0];
+    // (uv span, config, lod word, the color the picked level answers)
+    let cases: [((f32, f32, f32, f32), u32, u32, [u8; 4], &str); 6] = [
+        ((0.0, 0.0, 0.5, 0.5), 0, 2 << 16, red, "level 0, magnified"),
+        (
+            (0.0, 0.0, 1.0, 1.0),
+            0,
+            2 << 16,
+            green,
+            "level 1, one texel a pixel",
+        ),
+        (
+            (0.0, 0.0, 2.0, 2.0),
+            0,
+            2 << 16,
+            blue,
+            "level 2, four texels a pixel",
+        ),
+        (
+            (0.0, 0.0, 1.41421354, 1.41421354),
+            0,
+            2 << 16,
+            green,
+            "halfway takes the bigger level",
+        ),
+        (
+            (0.0, 0.0, 1.0, 1.0),
+            0,
+            (2 << 16) | 0xFF00,
+            red,
+            "a bias of minus one",
+        ),
+        (
+            (0.0, 0.0, 1.41421354, 1.41421354),
+            1 << 24,
+            2 << 16,
+            mixed,
+            "the two levels about the level blend",
+        ),
+    ];
+    for (span, config, lod, expected, name) in cases {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        lay_texture(&mut cpu, TEXTURE, &texels, 0, 32, 32, 3);
+        lay_texture(&mut gl, TEXTURE, &texels, 0, 32, 32, 3);
+        bind_texture_unit(&mut registers, 0, TEXTURE, 32, 32, 0, config, lod);
+        tev_stage(
+            &mut registers,
+            0,
+            [3, 3, 3],
+            [3, 3, 3],
+            [0; 3],
+            [0; 3],
+            0,
+            0,
+            0,
+        );
+        tev_passthrough(&mut registers, &[0]);
+        let quad = uv_quad(viewport, &[(&0, span.0, span.1, span.2, span.3)]);
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_identical(&cpu, &gl, name);
+        for (index, pixel) in image(&cpu).iter().enumerate() {
+            assert_eq!(
+                pixel[0], expected[0],
+                "{name}: pixel {index} is not the level the rate picks"
+            );
+        }
+    }
+}
+
+/// every combiner operation folds its three sources the same on both sides, the
+/// operands picking which channels feed it
+#[test]
+fn opengl_tev_combiner_operations_match_the_cpu() {
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    let texels: Vec<u8> = (0..64 * 4).map(pattern_byte).collect();
+    for (op, name) in [
+        (0u32, "replace"),
+        (1, "modulate"),
+        (2, "add"),
+        (3, "add signed"),
+        (4, "lerp"),
+        (5, "subtract"),
+        (6, "dot3 rgb"),
+        (7, "dot3 rgba"),
+        (8, "multiply add"),
+        (9, "add multiply"),
+    ] {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        lay_texture(&mut cpu, TEXTURE, &texels, 0, 8, 8, 1);
+        lay_texture(&mut gl, TEXTURE, &texels, 0, 8, 8, 1);
+        bind_texture_unit(&mut registers, 0, TEXTURE, 8, 8, 0, 0, 0);
+        // texture 0, the stage constant and the vertex color in the three inputs
+        tev_stage(
+            &mut registers,
+            0,
+            [3, 0xE, 0x0],
+            [3, 0xE, 0x0],
+            [0; 3],
+            [0; 3],
+            op | (op << 16),
+            0x4080_C020,
+            0,
+        );
+        tev_passthrough(&mut registers, &[0]);
+        let quad = uv_quad(viewport, &[(&0, 0.0, 0.0, 1.0, 1.0)]);
+        let placed = placed_triangles(&registers, &quad);
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_close(&cpu, &gl, &placed, 1, &format!("combiner {name}"));
+    }
+}
+
+/// the combiner buffer hands a stage's result to the stage after next, the
+/// buffer's own color in between, color and alpha updating separately, and the
+/// output scales multiplying past one
+#[test]
+fn opengl_tev_buffer_and_scales_match_the_cpu() {
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    let texels: Vec<u8> = (0..64 * 4).map(pattern_byte).collect();
+    let cases: [(u32, u32, &str); 3] = [
+        (0x1100, 0, "color and alpha update the buffer"),
+        (0x0100, 0, "color alone updates the buffer"),
+        (0x1100, 0x0001_0001, "the output scale doubles"),
+    ];
+    for (update, scale, name) in cases {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        lay_texture(&mut cpu, TEXTURE, &texels, 0, 8, 8, 1);
+        lay_texture(&mut gl, TEXTURE, &texels, 0, 8, 8, 1);
+        bind_texture_unit(&mut registers, 0, TEXTURE, 8, 8, 0, 0, 0);
+        // stage 0 takes the texture thru, writing the buffer
+        tev_stage(
+            &mut registers,
+            0,
+            [3, 3, 3],
+            [3, 3, 3],
+            [0; 3],
+            [0; 3],
+            0,
+            0,
+            0,
+        );
+        registers[TEV_UPDATE_BUFFER] = update;
+        registers[TEV_BUFFER_COLOR] = 0x4080_C020;
+        // stage 2 folds the buffer over the constant, signed, at a scale
+        tev_stage(
+            &mut registers,
+            2,
+            [0xF, 0xE, 0xF],
+            [0xF, 0xE, 0xF],
+            [0; 3],
+            [0; 3],
+            3 | (3 << 16),
+            0x4080_C020,
+            scale,
+        );
+        tev_passthrough(&mut registers, &[0, 2]);
+        let quad = uv_quad(viewport, &[(&0, 0.0, 0.0, 1.0, 1.0)]);
+        let placed = placed_triangles(&registers, &quad);
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_close(&cpu, &gl, &placed, 1, name);
+    }
+}
+
+/// two units sample in one draw, unit 2 reads coordinate set 1 instead of its
+/// own, and a projected unit 0 divides its coordinates by set 0's w
+#[test]
+fn opengl_texture_units_and_coordinates_match_the_cpu() {
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    let first: Vec<u8> = (0..64 * 4).map(pattern_byte).collect();
+    let second: Vec<u8> = (0..64 * 4)
+        .map(|index| pattern_byte(index ^ 0x55))
+        .collect();
+    // (a) units 0 and 1 modulate each other, each on its own coordinate set
+    {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        lay_texture(&mut cpu, TEXTURE, &first, 0, 8, 8, 1);
+        lay_texture(&mut gl, TEXTURE, &first, 0, 8, 8, 1);
+        lay_texture(&mut cpu, OTHER_TEXTURE, &second, 0, 8, 8, 1);
+        lay_texture(&mut gl, OTHER_TEXTURE, &second, 0, 8, 8, 1);
+        bind_texture_unit(&mut registers, 0, TEXTURE, 8, 8, 0, 0, 0);
+        bind_texture_unit(&mut registers, 1, OTHER_TEXTURE, 8, 8, 0, 0, 0);
+        tev_stage(
+            &mut registers,
+            0,
+            [3, 4, 3],
+            [3, 4, 3],
+            [0; 3],
+            [0; 3],
+            1 | (1 << 16),
+            0,
+            0,
+        );
+        tev_passthrough(&mut registers, &[0]);
+        let quad = uv_quad(
+            viewport,
+            &[(&0, 0.0, 0.0, 1.0, 1.0), (&1, 0.25, 0.125, 0.75, 0.875)],
+        );
+        let placed = placed_triangles(&registers, &quad);
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_close(&cpu, &gl, &placed, 1, "units 0 and 1 modulate");
+    }
+    // (b) unit 2 reads coordinate set 1
+    {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        registers[REG_TEXTURE_CONFIG] |= 1 << 13;
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        lay_texture(&mut cpu, TEXTURE, &first, 0, 8, 8, 1);
+        lay_texture(&mut gl, TEXTURE, &first, 0, 8, 8, 1);
+        bind_texture_unit(&mut registers, 2, TEXTURE, 8, 8, 0, 0, 0);
+        tev_stage(
+            &mut registers,
+            0,
+            [5, 5, 5],
+            [5, 5, 5],
+            [0; 3],
+            [0; 3],
+            0,
+            0,
+            0,
+        );
+        tev_passthrough(&mut registers, &[0]);
+        let quad = uv_quad(viewport, &[(&1, 0.0, 0.0, 1.0, 1.0)]);
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_identical(&cpu, &gl, "unit 2 on set 1");
+    }
+    // (c) a projected unit 0 divides its coordinates by set 0's w
+    {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        lay_texture(&mut cpu, TEXTURE, &first, 0, 8, 8, 1);
+        lay_texture(&mut gl, TEXTURE, &first, 0, 8, 8, 1);
+        bind_texture_unit(&mut registers, 0, TEXTURE, 8, 8, 0, 3 << 28, 0);
+        tev_stage(
+            &mut registers,
+            0,
+            [3, 3, 3],
+            [3, 3, 3],
+            [0; 3],
+            [0; 3],
+            0,
+            0,
+            0,
+        );
+        tev_passthrough(&mut registers, &[0]);
+        let mut quad = uv_quad(viewport, &[(&0, 0.0, 0.0, 2.0, 2.0)]);
+        for vertex in &mut quad {
+            vertex.texcoord0_w = 2.0;
+        }
+        let placed = placed_triangles(&registers, &quad);
+        rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &quad);
+        rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_close(&cpu, &gl, &placed, 1, "projected coordinates");
+    }
+}
+
+/// a texture decoded once rides its GL upload across draws without a second
+/// read of guest memory; bytes written over it between command lists decode
+/// again; and a small budget turns textures over with the pixels staying right
+#[test]
+fn opengl_texture_cache_reuse_invalidation_and_eviction() {
+    let viewport = (0.0, 0.0, 16.0, 16.0);
+    let first: Vec<u8> = (0..64 * 4).map(pattern_byte).collect();
+    let second: Vec<u8> = (0..64 * 4)
+        .map(|index| pattern_byte(index ^ 0xAA))
+        .collect();
+    let draw = |registers: &[u32], memory: &mut CountingMemory, resources: &mut Resources| {
+        let quad = uv_quad(viewport, &[(&0, 0.0, 0.0, 1.0, 1.0)]);
+        rasterize_shaded(registers, memory, resources, &quad);
+    };
+    // (a) the second draw over the same texture decodes nothing
+    {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        lay_texture(&mut gl, TEXTURE, &first, 0, 8, 8, 1);
+        bind_texture_unit(&mut registers, 0, TEXTURE, 8, 8, 0, 0, 0);
+        tev_stage(
+            &mut registers,
+            0,
+            [3, 3, 3],
+            [3, 3, 3],
+            [0; 3],
+            [0; 3],
+            0,
+            0,
+            0,
+        );
+        tev_passthrough(&mut registers, &[0]);
+        draw(&registers, &mut gl, &mut resources);
+        let reads_after_first = gl.reads_over(TEXTURE, 256);
+        assert!(reads_after_first >= 1, "the first draw decoded the texture");
+        draw(&registers, &mut gl, &mut resources);
+        assert_eq!(
+            gl.reads_over(TEXTURE, 256),
+            reads_after_first,
+            "the second draw re-decoded a texture nothing touched"
+        );
+        resolve(&mut resources, &mut gl, 0);
+    }
+    // (b) bytes written over the texture between command lists decode again
+    {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        let mut registers = registers(0);
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        lay_texture(&mut cpu, TEXTURE, &first, 0, 8, 8, 1);
+        lay_texture(&mut gl, TEXTURE, &first, 0, 8, 8, 1);
+        bind_texture_unit(&mut registers, 0, TEXTURE, 8, 8, 0, 0, 0);
+        tev_stage(
+            &mut registers,
+            0,
+            [3, 3, 3],
+            [3, 3, 3],
+            [0; 3],
+            [0; 3],
+            0,
+            0,
+            0,
+        );
+        tev_passthrough(&mut registers, &[0]);
+        draw(&registers, &mut cpu, &mut Resources::default());
+        draw(&registers, &mut gl, &mut resources);
+        // the CPU writes new bytes over the texture, then a new command list starts
+        let replacement = tiled_texture(&second, 0, 8, 8);
+        cpu.flat[TEXTURE as usize..TEXTURE as usize + replacement.len()]
+            .copy_from_slice(&replacement);
+        gl.flat[TEXTURE as usize..TEXTURE as usize + replacement.len()]
+            .copy_from_slice(&replacement);
+        let before = image(&cpu);
+        resources.textures.begin_list();
+        draw(&registers, &mut cpu, &mut Resources::default());
+        draw(&registers, &mut gl, &mut resources);
+        resolve(&mut resources, &mut gl, 0);
+        assert_images_identical(&cpu, &gl, "rewritten texture bytes");
+        assert_ne!(
+            image(&cpu),
+            before,
+            "the rewritten texture answered with different bytes"
+        );
+    }
+    // (c) a budget of a couple of textures turns them over, the pixels stay right
+    {
+        let Some(mut resources) = opengl_resources() else {
+            return;
+        };
+        resources
+            .opengl
+            .as_mut()
+            .unwrap()
+            .limit_texture_cache(2 * 8 * 8 * 4);
+        let mut registers = registers(0);
+        let mut gl = CountingMemory::zeroed(0x1_0000);
+        lay_texture(&mut gl, TEXTURE, &first, 0, 8, 8, 1);
+        lay_texture(&mut gl, OTHER_TEXTURE, &second, 0, 8, 8, 1);
+        tev_stage(
+            &mut registers,
+            0,
+            [3, 3, 3],
+            [3, 3, 3],
+            [0; 3],
+            [0; 3],
+            0,
+            0,
+            0,
+        );
+        tev_passthrough(&mut registers, &[0]);
+        let mut cpu = CountingMemory::zeroed(0x1_0000);
+        for (addr, texels) in [
+            (TEXTURE, &first),
+            (OTHER_TEXTURE, &second),
+            (TEXTURE, &first),
+        ] {
+            let mut registers = registers.clone();
+            lay_texture(&mut gl, addr, texels, 0, 8, 8, 1);
+            lay_texture(&mut cpu, addr, texels, 0, 8, 8, 1);
+            registers[REG_TEXTURE_CONFIG] = 1;
+            registers[TEXTURE_UNIT_BASES[0] + 1] = 8 | (8 << 16);
+            registers[TEXTURE_UNIT_BASES[0] + 2] = 0;
+            registers[TEXTURE_UNIT_BASES[0] + 3] = 0;
+            registers[TEXTURE_UNIT_BASES[0] + 4] = addr >> 3;
+            registers[TEXTURE_UNIT_BASES[0] + 13] = 0;
+            draw(&registers, &mut cpu, &mut Resources::default());
+            draw(&registers, &mut gl, &mut resources);
+            resolve(&mut resources, &mut gl, 0);
+            assert_images_identical(
+                &cpu,
+                &gl,
+                &format!("after turning the cache over to {addr:#x}"),
+            );
+        }
+    }
+}
+/// a draw the OpenGL path cannot take — a logic op, a non-RGBA8 target, a blend
+/// factor GL lacks, fog, procedural textures or fragment lighting — falls back to
+/// the CPU rasterizer after syncing what the GL drew, and the bytes match a run
+/// that never saw the GL at all
 #[test]
 fn opengl_unsupported_draws_fall_back_after_syncing_and_match_the_cpu() {
     // (an unaligned target would join these, but the CPU rasterizer itself panics
     // on tile-unaligned widths today, see the ignored regression test and TODO.md)
     type StateChange = fn(&mut Vec<u32>);
-    let cases: [(&str, StateChange); 4] = [
+    let cases: [(&str, StateChange); 6] = [
         ("a logic op", |registers| {
             registers[REG_COLOR_OPERATION] = 0;
             registers[REG_LOGIC_OP] = 6; // XOR, not the copy that reads as none
-        }),
-        ("a texture", |registers| {
-            // unit 0 on, an 8x8 RGBA8 texture sitting inside the target's own bytes
-            registers[REG_TEXTURE_CONFIG] = 1;
-            registers[TEXTURE_UNIT_BASES[0] + 1] = 8 | (8 << 16);
-            registers[TEXTURE_UNIT_BASES[0] + 4] = COLOR >> 3;
-            registers[TEXTURE_UNIT_BASES[0] + 13] = 0; // RGBA8
         }),
         ("an RGB8 target", |registers| {
             registers[REG_COLOR_BUFFER_FORMAT] = 1 << 16;
@@ -1871,6 +2712,23 @@ fn opengl_unsupported_draws_fall_back_after_syncing_and_match_the_cpu() {
             // source alone, a draw using it as a destination stays on the CPU
             registers[REG_COLOR_OPERATION] = 0x100;
             registers[REG_BLEND_FUNC] = 0x11E1_0000; // color side: add, one, the saturate factor as the destination
+        }),
+        ("fog", |registers| {
+            registers[crate::fog::REG_MODE] = 5; // the mode that mixes the fog in
+        }),
+        ("procedural textures", |registers| {
+            registers[REG_TEXTURE_CONFIG] |= 1 << 10;
+        }),
+        ("fragment lighting", |registers| {
+            // the lighting on, and a combiner reading its colors, a stage
+            // modulating the primary fragment color w/ texture 0
+            registers[0x08F] = 1;
+            registers[0x0C0] = 0x0003_0013;
+            registers[0x0C2] = 1;
+            registers[REG_TEXTURE_CONFIG] = 1;
+            registers[TEXTURE_UNIT_BASES[0] + 1] = 8 | (8 << 16);
+            registers[TEXTURE_UNIT_BASES[0] + 4] = 0x6000 >> 3;
+            registers[TEXTURE_UNIT_BASES[0] + 13] = 0; // RGBA8
         }),
     ];
     for (name, apply) in cases {
@@ -1977,6 +2835,15 @@ fn opengl_overlapping_surfaces_resolve_each_other() {
     let mut gl = CountingMemory::zeroed(0x1_0000);
     let mut cpu = CountingMemory::zeroed(0x1_0000);
     let output = opengl::OutputState::default();
+    let textures = opengl::TextureSetup {
+        units: [None, None, None],
+        texture0_projected: false,
+        texture2_uses_coord1: false,
+        tev: crate::tev::TevUniforms {
+            all_passthrough: true,
+            ..Default::default()
+        },
+    };
     {
         let renderer = resources.opengl.as_mut().unwrap();
         // A: color at 0x1000 and D16 depth at 0x3000
@@ -1987,6 +2854,7 @@ fn opengl_overlapping_surfaces_resolve_each_other() {
                 Some(&depth(0x3000)),
                 map,
                 &output,
+                &textures,
                 &[screen_triangle],
             )
             .expect("the first draw");
@@ -1998,6 +2866,7 @@ fn opengl_overlapping_surfaces_resolve_each_other() {
                 Some(&depth(0x3100)),
                 map,
                 &output,
+                &textures,
                 &[screen_triangle],
             )
             .expect("the second draw");

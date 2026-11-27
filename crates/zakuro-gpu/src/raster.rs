@@ -2013,8 +2013,58 @@ fn texture_range<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Op
     if width == 0 || height == 0 || address == 0 {
         return None;
     }
-    let size = texture_bytes(format, width, height, level_count(registers, base, width, height));
+    let size = texture_bytes(
+        format,
+        width,
+        height,
+        level_count(registers, base, width, height),
+    );
     Some((memory.translate(address), size as u32))
+}
+
+/// a draw's texture units and combiners as the OpenGL uber-shader takes them,
+/// or None when a bound unit carries state the shader cannot run yet
+#[cfg(feature = "opengl")]
+fn gl_texture_setup(state: &DrawState) -> Option<opengl::TextureSetup> {
+    let units = std::array::from_fn(|unit| {
+        state.textures[unit]
+            .as_ref()
+            .map(|texture| opengl::TextureUnit {
+                texels: texture.texels.clone(),
+                width: texture.width,
+                height: texture.height,
+                levels: texture.levels,
+                mag_linear: texture.linear,
+                min_linear: texture.lod.linear,
+                wrap_s: gl_wrap(texture.wrap_s),
+                wrap_t: gl_wrap(texture.wrap_t),
+                border: texture.border,
+                lod: [
+                    f32::from(texture.lod.bias) / 256.0,
+                    f32::from(texture.lod.min),
+                    f32::from(texture.lod.max),
+                    texture.lod.between as u32 as f32,
+                ],
+            })
+    });
+    Some(opengl::TextureSetup {
+        units,
+        texture0_projected: state.texture0_projected,
+        texture2_uses_coord1: state.texture2_uses_coord1,
+        tev: state.tex_env.opengl_uniforms(),
+    })
+}
+
+/// the wrap modes onto the shader's numbers, which happen to be the order the
+/// Wrap enum lists them in: clamp to edge, clamp to border, repeat, mirrored
+#[cfg(feature = "opengl")]
+fn gl_wrap(wrap: Wrap) -> u32 {
+    match wrap {
+        Wrap::ClampToEdge => 0,
+        Wrap::ClampToBorder => 1,
+        Wrap::Repeat => 2,
+        Wrap::MirroredRepeat => 3,
+    }
 }
 
 /// where and how depth testing reads/writes, or None when off
@@ -3209,23 +3259,48 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             state.target.write,
         );
         if let Some(output) = output {
+            // the texture units as the uber-shader takes them, and the combiners
+            let texture_setup = gl_texture_setup(&state);
             let supported = state.target.buffer_width.is_multiple_of(8)
                 && state.target.buffer_height.is_multiple_of(8)
                 && state.target.format == ColorFormat::Rgba8
-                && state.textures.iter().all(Option::is_none)
                 && state.proctex.is_none()
                 && state.lighting.is_none()
                 && state.fog.is_none()
-                && state.tex_env.is_vertex_color_passthrough()
+                && texture_setup.is_some()
                 && state.depth_stencil.as_ref().map_or(true, |depth| {
-                    let color_end = state.target.addr.saturating_add(state.target.buffer_width.saturating_mul(state.target.buffer_height).saturating_mul(4));
-                    let depth_end = depth.addr.saturating_add(state.target.buffer_width.saturating_mul(state.target.buffer_height).saturating_mul(depth.bytes));
+                    let color_end = state.target.addr.saturating_add(
+                        state
+                            .target
+                            .buffer_width
+                            .saturating_mul(state.target.buffer_height)
+                            .saturating_mul(4),
+                    );
+                    let depth_end = depth.addr.saturating_add(
+                        state
+                            .target
+                            .buffer_width
+                            .saturating_mul(state.target.buffer_height)
+                            .saturating_mul(depth.bytes),
+                    );
                     color_end <= depth.addr || depth_end <= state.target.addr
                 });
-            if supported {
-                match renderer.draw(memory, &state.target, state.depth_stencil.as_ref(), state.depth_map, &output, &triangles) {
+            let accelerated = supported && texture_setup.is_some();
+            if accelerated {
+                let texture_setup = texture_setup.expect("accelerated means the units are taken");
+                match renderer.draw(
+                    memory,
+                    &state.target,
+                    state.depth_stencil.as_ref(),
+                    state.depth_map,
+                    &output,
+                    &texture_setup,
+                    &triangles,
+                ) {
                     Ok(()) => return Some(triangle_count as u32),
-                    Err(error) => log::error!("the OpenGL rasterizer could not draw, {error}, drawing in software"),
+                    Err(error) => log::error!(
+                        "the OpenGL rasterizer could not draw, {error}, drawing in software"
+                    ),
                 }
             }
         }

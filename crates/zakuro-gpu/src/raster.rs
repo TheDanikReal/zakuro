@@ -1133,10 +1133,15 @@ fn buffer_size(registers: &[u32], (x, y, width, height): (f32, f32, f32, f32)) -
     ((dimensions & 0x7FF).max(right.max(1) as u32), (((dimensions >> 12) & 0x3FF) + 1).max(top.max(1) as u32))
 }
 
+/// a semantic no output register carries, which takes its default
+pub(crate) const MISSING: u32 = u32::MAX;
+/// a semantic in an output attribute past the enabled registers, zero
+pub(crate) const ZERO: u32 = u32::MAX - 1;
+
 /// where the GPU's vertex shader finds each varying, per semantic component of position, color, texture coords 0,
 /// 1 and 2, the quaternion, the view vector and coord set 0's w
 /// the output register times four plus the component, like to_vertex reads them
-#[cfg(feature = "vulkan")]
+#[cfg(any(feature = "vulkan", feature = "opengl"))]
 fn output_semantics(registers: &[u32]) -> [u32; 24] {
     let map = read_output_map(registers);
     let mask = registers[REG_VS_OUTPUT_MASK] & 0xFFFF;
@@ -1149,9 +1154,9 @@ fn output_semantics(registers: &[u32]) -> [u32; 24] {
     }
     let enabled = &enabled[..count];
     let slot = |slot: Option<(usize, usize)>| match slot {
-        None => hardware::MISSING,
+        None => MISSING,
         Some((attribute, component)) => {
-            enabled.get(attribute).map_or(hardware::ZERO, |&register| (register * 4 + component) as u32)
+            enabled.get(attribute).map_or(ZERO, |&register| (register * 4 + component) as u32)
         }
     };
     let [t0, t1, t2] = map.texcoords;
@@ -1166,7 +1171,7 @@ fn output_semantics(registers: &[u32]) -> [u32; 24] {
         .chain(map.quaternion)
         .chain(map.view)
         .chain([map.texcoord0_w]);
-    let mut semantics = [hardware::MISSING; 24];
+    let mut semantics = [MISSING; 24];
     for (semantic, found) in semantics.iter_mut().zip(slots) {
         *semantic = slot(found);
     }
@@ -1190,14 +1195,14 @@ pub(crate) fn placing_outputs(registers: &[u32]) -> (u16, u16) {
 
 /// the semantics output_semantics worked out for the last draw,
 /// and the registers they came from (the output map and mask), draws mostly keep those
-#[cfg(feature = "vulkan")]
+#[cfg(any(feature = "vulkan", feature = "opengl"))]
 #[derive(Default)]
 struct LastSemantics {
     read: [u32; 9],
     semantics: Option<[u32; 24]>,
 }
 
-#[cfg(feature = "vulkan")]
+#[cfg(any(feature = "vulkan", feature = "opengl"))]
 impl LastSemantics {
     fn get(&mut self, registers: &[u32]) -> [u32; 24] {
         let mut read = [0; 9];
@@ -1525,7 +1530,7 @@ pub struct Resources {
     tex_env: crate::tev::LastTexEnv,
     lighting: crate::lighting::LastLighting,
     /// where the last draw's varyings were in the output registers
-    #[cfg(feature = "vulkan")]
+    #[cfg(any(feature = "vulkan", feature = "opengl"))]
     semantics: LastSemantics,
     /// the host GPU, when draws go to it instead of the software path
     #[cfg(feature = "vulkan")]
@@ -2841,6 +2846,36 @@ impl Edge {
     }
 }
 
+/// the target and state the OpenGL rasterizer takes a draw under, past what the
+/// texture setup and the output merger already answered for
+#[cfg(feature = "opengl")]
+fn gl_target_supported(state: &DrawState) -> bool {
+    state.target.buffer_width.is_multiple_of(8)
+        && state.target.buffer_height.is_multiple_of(8)
+        && matches!(
+            state.target.format,
+            ColorFormat::Rgba8 | ColorFormat::Rgb8 | ColorFormat::Rgb565 | ColorFormat::Rgb5A1 | ColorFormat::Rgba4
+        )
+        && state.proctex.is_none()
+        && state.depth_stencil.as_ref().map_or(true, |depth| {
+            let color_end = state.target.addr.saturating_add(
+                state
+                    .target
+                    .buffer_width
+                    .saturating_mul(state.target.buffer_height)
+                    .saturating_mul(state.target.format.bytes_per_pixel() as u32),
+            );
+            let depth_end = depth.addr.saturating_add(
+                state
+                    .target
+                    .buffer_width
+                    .saturating_mul(state.target.buffer_height)
+                    .saturating_mul(depth.bytes),
+            );
+            color_end <= depth.addr || depth_end <= state.target.addr
+        })
+}
+
 /// runs a draw call, fetches vertices, shades them, assembles triangles and fills them, returns the number of vertices processed
 pub fn draw<M: GpuMemory>(
     registers: &[u32],
@@ -3106,7 +3141,7 @@ fn primitives<'a>(
 }
 
 /// the vertices of each triangle out of count of them, for a list, a strip (1) or a fan (2)
-fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
+pub(crate) fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
     match topology {
         1 => (2..count).map(|i| if i % 2 == 0 { (i - 2, i - 1, i) } else { (i - 1, i - 2, i) }).collect(),
         2 => (2..count).map(|i| (0, i - 1, i)).collect(),
@@ -3266,6 +3301,60 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         }
     }
     let (processed, placed_here);
+    // the OpenGL rasterizer runs the vertex shader itself on draws that have one
+    // and no geometry shader after it, GL clipping and culling like the PICA does
+    // with the volume and winding the translated shader hands it; a geometry
+    // shader's draws go thru the CPU's preparation instead
+    #[cfg(feature = "opengl")]
+    if resources.opengl.is_some() {
+        if let Vertices::Unshaded { vertex_shader, inputs, order, .. } = vertices {
+            if registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 {
+                // the output merger the GL path mirrors w/ its fixed function, the
+                // texture units and combiners as the uber-shader takes them, and the
+                // fragment stages past the units: none of it changes w/ the vertices
+                let output = opengl::output_state(
+                    state.blend.as_ref(),
+                    state.logic_op,
+                    state.alpha_test.as_ref().map(|test| (test.function, test.reference)),
+                    state.target.write,
+                );
+                let texture_setup = gl_texture_setup(&state).filter(|_| gl_target_supported(&state));
+                if let (Some(output), Some(texture_setup)) = (output, texture_setup) {
+                    let semantics = resources.semantics.get(registers);
+                    let shaded = opengl::ShadedDraw {
+                        unit: vertex_shader,
+                        inputs,
+                        order,
+                        semantics,
+                        viewport,
+                        cull: registers[REG_FACE_CULLING] & 0x3,
+                        flip: upside_down(registers),
+                        topology: (registers[REG_PRIMITIVE_CONFIG] >> 8) & 0x3,
+                    };
+                    let fragment = opengl::FragmentSetup {
+                        lighting: state.lighting,
+                        tables: state.tables,
+                        fog: state.fog.as_ref(),
+                    };
+                    match resources.opengl.as_mut().unwrap().draw_shaded(
+                        memory,
+                        &state.target,
+                        state.depth_stencil.as_ref(),
+                        state.depth_map,
+                        &output,
+                        &texture_setup,
+                        &fragment,
+                        &shaded,
+                    ) {
+                        Ok(triangles) => return Some(triangles),
+                        Err(error) => log::error!(
+                            "the OpenGL rasterizer could not shade the vertices, {error}, shading on the CPU"
+                        ),
+                    }
+                }
+            }
+        }
+    }
     // the order goes to the software path, only the GPU falls back on it
     #[cfg_attr(not(feature = "vulkan"), allow(unused_variables))]
     let (shaded, order, placement) = match vertices {
@@ -3344,34 +3433,9 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 tables: state.tables,
                 fog: state.fog.as_ref(),
             };
-            let supported = state.target.buffer_width.is_multiple_of(8)
-                && state.target.buffer_height.is_multiple_of(8)
-                && matches!(
-                    state.target.format,
-                    ColorFormat::Rgba8 | ColorFormat::Rgb8 | ColorFormat::Rgb565 | ColorFormat::Rgb5A1 | ColorFormat::Rgba4
-                )
-                && state.proctex.is_none()
-                && texture_setup.is_some()
-                && state.depth_stencil.as_ref().map_or(true, |depth| {
-                    let color_end = state.target.addr.saturating_add(
-                        state
-                            .target
-                            .buffer_width
-                            .saturating_mul(state.target.buffer_height)
-                            .saturating_mul(state.target.format.bytes_per_pixel() as u32),
-                    );
-                    let depth_end = depth.addr.saturating_add(
-                        state
-                            .target
-                            .buffer_width
-                            .saturating_mul(state.target.buffer_height)
-                            .saturating_mul(depth.bytes),
-                    );
-                    color_end <= depth.addr || depth_end <= state.target.addr
-                });
-            let accelerated = supported && texture_setup.is_some();
-            if accelerated {
-                let texture_setup = texture_setup.expect("accelerated means the units are taken");
+            let supported = texture_setup.is_some() && gl_target_supported(&state);
+            if supported {
+                let texture_setup = texture_setup.expect("supported means the units are taken");
                 match renderer.draw(
                     memory,
                     &state.target,
@@ -3686,6 +3750,21 @@ mod tests {
     /// an 8x8 RGBA8 target w/ color writes on and a D24S8 buffer beside it
     pub(crate) fn rasterize_shaded<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, shaded: &[Vertex]) -> u32 {
         rasterize(registers, memory, resources, Vertices::Shaded(shaded)).unwrap_or(0)
+    }
+
+    /// a draw whose vertices still run the shader: the OpenGL path shades them
+    /// on the GPU when it can, the CPU otherwise, and one with a geometry
+    /// shader after the vertex shader always prepares on the CPU
+    pub(crate) fn rasterize_unshaded<M: GpuMemory>(
+        registers: &[u32],
+        memory: &mut M,
+        resources: &mut Resources,
+        vertex_shader: &ShaderUnit,
+        geometry_shader: &ShaderUnit,
+        inputs: &[[Vec4; shader::INPUT_REGISTERS]],
+    ) -> u32 {
+        let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order: None };
+        rasterize(registers, memory, resources, vertices).unwrap_or(0)
     }
 
     fn target_registers() -> Vec<u32> {

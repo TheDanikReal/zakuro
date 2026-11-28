@@ -13,7 +13,8 @@
 //! On a headless machine the context comes from GLX on Mesa's llvmpipe:
 //! `xvfb-run -a cargo test -p zakuro-gpu --features opengl`
 
-use super::tests::rasterize_shaded;
+use super::tests::{rasterize_shaded, rasterize_unshaded};
+use crate::shader::INPUT_REGISTERS;
 use glow::HasContext;
 use crate::format::morton_offset;
 use crate::raster::*;
@@ -3281,7 +3282,8 @@ fn gpu_with_draw(
     const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
     gpu.vertex_shader.descriptors[0] = 0xF | IDENTITY;
     let mov = |destination: u32, source: u32| 0x13 << 26 | destination << 21 | source << 12;
-    gpu.vertex_shader.program[..3].copy_from_slice(&[mov(0, 0x00), mov(1, 0x20), 0x22 << 26]);
+    // 0x01 is input v1, while 0x20 is float constant c0
+    gpu.vertex_shader.program[..3].copy_from_slice(&[mov(0, 0x00), mov(1, 0x01), 0x22 << 26]);
 
     let mut registers = registers(depth_format);
     if depth_writes {
@@ -3381,6 +3383,194 @@ fn opengl_command_list_draws_and_transfers_like_the_cpu() {
         cpu_memory.region(COLOR, COLOR_BYTES),
         "the resolved target differs",
     );
+    // FLAT is [0.5, 0.25, 0.75, 0.5], which both backends floor to
+    // [127, 63, 191, 127] in RGBA; image() gives the guest's ABGR bytes, so the
+    // known covered pixel reads [alpha, blue, green, red], the vertex shader
+    // having carried the color from the array to the pixel
+    assert_eq!(
+        image(&gl_memory)[8 * BUFFER as usize + 8],
+        [127, 191, 63, 127],
+        "the command-list draw did not use the per-vertex FLAT color",
+    );
+}
+
+/// draws the GPU shades itself: the vertex shader runs translated on the
+/// OpenGL side and interpreted on the CPU, its math moving the positions and
+/// mixing the colors, and the pixels come out the same
+#[test]
+fn opengl_vertex_shaders_match_the_cpu() {
+    let Some(mut resources) = opengl_resources() else {
+        return;
+    };
+    let mut registers = registers(0);
+    const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
+    let mut unit = ShaderUnit::new();
+    unit.descriptors[0] = 0xF | IDENTITY;
+    // a temp = v1 * c1, o1 = temp + c2, o0 = v0 * c0, end: the color and the
+    // position both come out of the program's math, not of the inputs as is
+    let mul = |destination: u32, wide: u32, narrow: u32| (0x08 << 26) | (destination << 21) | (wide << 12) | (narrow << 7);
+    let add = |destination: u32, wide: u32, narrow: u32| (0x00 << 26) | (destination << 21) | (wide << 12) | (narrow << 7);
+    unit.program[..4].copy_from_slice(&[
+        mul(0x10, 0x21, 0x01),
+        add(0x01, 0x22, 0x10),
+        mul(0x00, 0x20, 0x00),
+        0x22 << 26,
+    ]);
+    unit.float_uniforms[0] = [0.75, 0.75, 0.75, 1.0];
+    unit.float_uniforms[1] = [1.0, 0.5, 0.25, 0.125];
+    unit.float_uniforms[2] = [0.25, 0.25, 0.25, 0.0];
+    unit.prepare();
+
+    // position out of register 0 and color out of 1, both enabled
+    registers[REG_SHADER_OUTPUT_TOTAL] = 2;
+    registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
+    registers[REG_SHADER_OUTPUT_MAP + 1] = 0x0B0A_0908;
+    registers[REG_VS_OUTPUT_MASK] = 0b11;
+
+    // one triangle over the target, uneven colors and w of one
+    let inputs: Vec<[Vec4; INPUT_REGISTERS]> = [
+        ([-1.0, -1.0], [1.0, 0.0, 0.0, 1.0]),
+        ([3.0, -1.0], [0.0, 1.0, 0.0, 1.0]),
+        ([-1.0, 3.0], [0.0, 0.0, 1.0, 1.0]),
+    ]
+    .into_iter()
+    .map(|([x, y], color)| {
+        let mut input = [shader::ZERO; INPUT_REGISTERS];
+        input[0] = [x, y, -0.5, 1.0];
+        input[1] = color;
+        input
+    })
+    .collect();
+
+    // the shaded vertices, whose placed triangles bound the comparison's edges:
+    // the program scales the position by c0 and mixes the color by c1 and c2
+    let placed = placed_triangles(
+        &registers,
+        &inputs
+            .iter()
+            .map(|input| Vertex {
+                clip: [
+                    input[0][0] * 0.75,
+                    input[0][1] * 0.75,
+                    input[0][2] * 0.75,
+                    input[0][3],
+                ],
+                color: std::array::from_fn(|i| input[1][i] * unit.float_uniforms[1][i] + unit.float_uniforms[2][i]),
+                texcoords: [[0.0; 2]; 3],
+                quaternion: [0.0; 4],
+                view: [0.0; 3],
+                texcoord0_w: 1.0,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let mut cpu = CountingMemory::zeroed(0x1_0000);
+    let mut gl = CountingMemory::zeroed(0x1_0000);
+    rasterize_unshaded(&registers, &mut cpu, &mut Resources::default(), &unit, &unit, &inputs);
+    rasterize_unshaded(&registers, &mut gl, &mut resources, &unit, &unit, &inputs);
+    // the draw reached the GL's vertex stage at all: a silent fallback to the
+    // CPU would make the comparison prove nothing
+    assert_eq!(
+        resources
+            .opengl
+            .as_ref()
+            .and_then(|renderer| renderer.surface_dirty(COLOR))
+            .map(|dirty| dirty as u32),
+        Some(1),
+        "the shaded draw did not submit to OpenGL",
+    );
+    resolve(&mut resources, &mut gl, 0);
+    // the interpolated colors round a step apart between the sides, like the
+    // placed tests' vertex colors do
+    assert_images_close(&cpu, &gl, &placed, 1, "vertex shaders shaded on the GPU");
+    // the combiner's alpha is the program's own 0.125, floored to 31 on both
+    // sides, and the scaled-away corner stays unwritten
+    assert_eq!(image(&gl)[4 * BUFFER as usize + 4][0], 31, "the covered pixel is not lit");
+    assert_eq!(image(&gl)[15 * BUFFER as usize + 15][0], 0, "the scaled-away corner drew");
+}
+
+/// a draw with a geometry shader after its vertex shader prepares on the CPU
+/// and draws thru the placed OpenGL path, matching the CPU's own run
+#[test]
+fn opengl_geometry_shader_draws_match_the_cpu() {
+    let Some(mut resources) = opengl_resources() else {
+        return;
+    };
+    let mut registers = registers(0);
+    const IDENTITY: u32 = 0x1B << 5 | 0x1B << 14 | 0x1B << 23;
+
+    // the vertex shader hands the position and the two offsets the geometry
+    // shader spreads the triangle's corners apart by
+    let mut vertex_shader = ShaderUnit::new();
+    vertex_shader.descriptors[0] = 0xF | IDENTITY;
+    let mov = |destination: u32, source: u32| 0x13 << 26 | destination << 21 | source << 12;
+    vertex_shader.program[..4].copy_from_slice(&[
+        mov(0, 0x00),
+        mov(1, 0x01),
+        mov(2, 0x02),
+        0x22 << 26,
+    ]);
+    vertex_shader.prepare();
+
+    // the geometry shader turns the one invocation into a triangle: the
+    // position as is, then over by the first offset, then up by the second
+    let mut geometry_shader = ShaderUnit::new();
+    geometry_shader.descriptors[0] = 0xF | IDENTITY;
+    let setemit = |slot: u32, primitive: bool| (0x2B << 26) | (slot << 24) | ((primitive as u32) << 23);
+    let emit = 0x2A << 26;
+    let add = |destination: u32, wide: u32, narrow: u32| (0x00 << 26) | (destination << 21) | (wide << 12) | (narrow << 7);
+    geometry_shader.program[..10].copy_from_slice(&[
+        setemit(0, false),
+        mov(0, 0x00),
+        emit,
+        setemit(1, false),
+        add(0, 0x00, 0x01),
+        emit,
+        setemit(2, true),
+        add(0, 0x00, 0x02),
+        emit,
+        0x22 << 26,
+    ]);
+    geometry_shader.prepare();
+
+    // the geometry stage on, three attribute vec4s an invocation, its one
+    // output register carrying the position
+    registers[REG_GEOSTAGE_CONFIG] = 2;
+    registers[REG_GS_CONFIG] = 0;
+    registers[REG_VS_OUTPUT_TOTAL] = 2; // three packed outputs a vertex
+    registers[REG_VS_OUTPUT_MASK] = 0b111;
+    registers[REG_GS_BLOCK + SHADER_INPUT_CONFIG] = 2; // three attribute vec4s an invocation
+    registers[REG_GS_BLOCK + SHADER_INPUT_MAP_LOW] = 0x210; // v0, v1 and v2
+    registers[REG_GS_BLOCK + SHADER_OUTPUT_MASK] = 0b1;
+    // position out of register 0, for the geometry stage's own outputs
+    registers[REG_SHADER_OUTPUT_TOTAL] = 1;
+    registers[REG_SHADER_OUTPUT_MAP] = 0x0302_0100;
+    registers[REG_SHADER_OUTPUT_MAP + 1] = 0x1F1F_1F1F;
+
+    let mut input = [shader::ZERO; INPUT_REGISTERS];
+    input[0] = [-0.5, -0.5, -0.5, 1.0];
+    input[1] = [1.0, 0.25, 0.0, 0.0]; // the first corner's offset
+    input[2] = [0.25, 1.0, 0.0, 0.0]; // the second corner's offset
+    let inputs = vec![input];
+
+    let mut cpu = CountingMemory::zeroed(0x1_0000);
+    let mut gl = CountingMemory::zeroed(0x1_0000);
+    rasterize_unshaded(&registers, &mut cpu, &mut Resources::default(), &vertex_shader, &geometry_shader, &inputs);
+    rasterize_unshaded(&registers, &mut gl, &mut resources, &vertex_shader, &geometry_shader, &inputs);
+    assert!(
+        resources
+            .opengl
+            .as_ref()
+            .and_then(|renderer| renderer.surface_dirty(COLOR))
+            .map(|dirty| dirty as u32)
+            == Some(1),
+        "the geometry shader's draw did not submit to OpenGL",
+    );
+    resolve(&mut resources, &mut gl, 0);
+    assert_images_identical(&cpu, &gl, "a geometry shader's draw");
+    // one triangle out of the one invocation: something drew, and it drew
+    // where the shader's offsets put it, not where the input vertex sat
+    let drawn = image(&gl).iter().filter(|pixel| pixel[0] == 255).count();
+    assert!(drawn > 0, "the geometry shader emitted nothing");
 }
 
 /// the display transfers the OpenGL renderer takes run on the GPU — the input
@@ -3587,9 +3777,11 @@ fn opengl_shows_transferred_screens_directly() {
     let source = cpu_memory.region(OUT, 16 * 16 * 4);
     for x in 0..16u32 {
         for y in 0..16u32 {
-            let pixel = &source[((x * 16 + (15 - y)) * 4) as usize..((x * 16 + (15 - y)) * 4 + 4) as usize];
+            // guest memory holds the format's ABGR bytes; the texture is RGBA
+            let at = ((x * 16 + (15 - y)) * 4) as usize;
+            let pixel = crate::format::ColorFormat::Rgba8.decode(&source[at..at + 4]);
             let shown = &upright[((y * 16 + x) * 4) as usize..((y * 16 + x) * 4 + 4) as usize];
-            assert_eq!(shown, pixel, "the upright picture differs at ({x},{y})");
+            assert_eq!(shown, pixel.as_slice(), "the upright picture differs at ({x},{y})");
         }
     }
     // and once guest memory takes the buffer back, the GPU shows nothing

@@ -602,6 +602,60 @@ struct CachedTexture {
 }
 
 /// the fragment shader's uniform locations, fetched once per context
+/// the vertices a draw hands the vertex stage
+    enum VertexSource {
+    /// placed vertices, six vec4s a vertex, drawn thru the vertex array
+    Placed {
+        floats: Vec<f32>,
+        uniforms: Uniforms,
+    },
+    /// the GPU shades: the shading block and the input registers ride the
+    /// storage buffers, the translated program runs, and GL clips and culls
+    /// the triangles the topology names
+    Shaded {
+        program: glow::Program,
+        uniforms: Uniforms,
+        /// the target's own size, which the placed position divides by
+        buffer_size: Option<glow::UniformLocation>,
+        /// whether the buffer's rows run from their top
+        flip: Option<glow::UniformLocation>,
+        flipped: bool,
+        /// the words the Shading block holds, uniforms first
+        words: Vec<u32>,
+        /// each input vertex's registers the program reads, four floats each
+        inputs: Vec<u8>,
+        /// the triangles into the input block, when an index buffer repeats vertices
+        indices: Option<(Vec<u8>, u32)>,
+        /// the vertices a straight draw runs over
+        count: usize,
+        /// the winding GL keeps, when the PICA culls anything
+        cull: Option<u32>,
+    },
+}
+
+
+/// a draw whose vertices the GL shades itself, the PICA vertex shader running
+/// translated, GL clipping and culling the triangles it makes
+pub(crate) struct ShadedDraw<'a> {
+    /// the vertex shader the GL runs
+    pub(crate) unit: &'a crate::shader::ShaderUnit,
+    /// each vertex's input registers, once each
+    pub(crate) inputs: &'a [[crate::shader::Vec4; crate::shader::INPUT_REGISTERS]],
+    /// which input each vertex of the draw is, when an index buffer repeats them
+    pub(crate) order: Option<&'a [usize]>,
+    /// where each varying the fragment stage reads sits in the output registers
+    pub(crate) semantics: [u32; crate::shader::glsl::SEMANTICS],
+    /// left, bottom, width and height, the viewport the PICA places with
+    pub(crate) viewport: (f32, f32, f32, f32),
+    /// GPUREG_FACECULLING_CONFIG, 0 keeps everything
+    pub(crate) cull: u32,
+    /// an upside down buffer's rows run from its top
+    pub(crate) flip: bool,
+    /// GPUREG_PRIMITIVE_CONFIG bits 9 to 8, a list, a strip or a fan
+    pub(crate) topology: u32,
+}
+
+#[derive(Clone)]
 struct Uniforms {
     depth_scale: Option<glow::UniformLocation>,
     depth_offset: Option<glow::UniformLocation>,
@@ -861,6 +915,62 @@ pub(crate) struct Transfer {
 }
 
 /// OpenGL resources are created and used on the thread where the context is current.
+impl Uniforms {
+    /// where a program's uniforms sit, the uber fragment stage and every
+    /// translated vertex stage sharing the same names
+    fn for_program(gl: &glow::Context, program: glow::Program) -> Uniforms {
+        unsafe {
+            Uniforms {
+
+            depth_scale: gl.get_uniform_location(program, "depth_scale"),
+            depth_offset: gl.get_uniform_location(program, "depth_offset"),
+            w_buffer: gl.get_uniform_location(program, "w_buffer"),
+            alpha_test: gl.get_uniform_location(program, "alpha_test"),
+            alpha_function: gl.get_uniform_location(program, "alpha_function"),
+            alpha_reference: gl.get_uniform_location(program, "alpha_reference"),
+            tex_enabled: gl.get_uniform_location(program, "tex_enabled[0]"),
+            tex_image: std::array::from_fn(|unit| {
+                gl.get_uniform_location(program, &format!("tex_image{unit}"))
+            }),
+            tex_size: std::array::from_fn(|unit| {
+                gl.get_uniform_location(program, &format!("tex_size[{unit}]"))
+            }),
+            tex_lod: std::array::from_fn(|unit| {
+                gl.get_uniform_location(program, &format!("tex_lod[{unit}]"))
+            }),
+            tex_wrap_s: gl.get_uniform_location(program, "tex_wrap_s[0]"),
+            tex_wrap_t: gl.get_uniform_location(program, "tex_wrap_t[0]"),
+            tex_border: gl.get_uniform_location(program, "tex_border[0]"),
+            tex_filter: gl.get_uniform_location(program, "tex_filter[0]"),
+            tex0_projected: gl.get_uniform_location(program, "tex0_projected"),
+            tev_active: gl.get_uniform_location(program, "tev_active"),
+            tev_color_sources: gl.get_uniform_location(program, "tev_color_sources[0]"),
+            tev_alpha_sources: gl.get_uniform_location(program, "tev_alpha_sources[0]"),
+            tev_color_operands: gl.get_uniform_location(program, "tev_color_operands[0]"),
+            tev_alpha_operands: gl.get_uniform_location(program, "tev_alpha_operands[0]"),
+            tev_color_ops: gl.get_uniform_location(program, "tev_color_ops[0]"),
+            tev_alpha_ops: gl.get_uniform_location(program, "tev_alpha_ops[0]"),
+            tev_constants: gl.get_uniform_location(program, "tev_constants[0]"),
+            tev_color_scales: gl.get_uniform_location(program, "tev_color_scales[0]"),
+            tev_alpha_scales: gl.get_uniform_location(program, "tev_alpha_scales[0]"),
+            tev_passthrough: gl.get_uniform_location(program, "tev_passthrough[0]"),
+            tev_update_mask: gl.get_uniform_location(program, "tev_update_mask"),
+            tev_buffer_color: gl.get_uniform_location(program, "tev_buffer_color"),
+            lighting_active: gl.get_uniform_location(program, "lighting_active"),
+            light_head: gl.get_uniform_location(program, "light_head"),
+            light_flags: gl.get_uniform_location(program, "light_flags"),
+            light_lookups: gl.get_uniform_location(program, "light_lookups[0]"),
+            light_ambient: gl.get_uniform_location(program, "light_ambient"),
+            light_data: gl.get_uniform_location(program, "light_data[0]"),
+            light_meta: gl.get_uniform_location(program, "light_meta[0]"),
+            fog_active: gl.get_uniform_location(program, "fog_active"),
+            fog_flip: gl.get_uniform_location(program, "fog_flip"),
+            fog_color: gl.get_uniform_location(program, "fog_color")
+            }
+        }
+    }
+}
+
 pub(crate) struct OpenGlRasterizer {
     gl: std::sync::Arc<glow::Context>,
     program: glow::Program,
@@ -904,6 +1014,29 @@ pub(crate) struct OpenGlRasterizer {
     last_lighting: Option<Vec<u32>>,
     /// the fog the last draw set
     last_fog: Option<([f32; 3], bool)>,
+    /// the vertex programs the GL shades draws with, by the program's
+    /// fingerprint, its entry point and the semantics it hands the varyings by
+    shaded_programs: HashMap<ShadedKey, Result<ShadedProgram, String>>,
+    /// the block the vertex stage reads its uniforms and state out of
+    shading_buffer: glow::Buffer,
+    /// the block each input vertex's registers ride to the vertex stage
+    inputs_buffer: glow::Buffer,
+    /// the triangles of a shaded draw, into the input block's vertices
+    indices_buffer: glow::Buffer,
+}
+
+/// what one compiled vertex program goes by
+type ShadedKey = (u64, u32, [u32; crate::shader::glsl::SEMANTICS]);
+
+/// a vertex stage for one translated program: the linked program and where its
+/// uniforms sit, plus the two per-draw values the fragment stage cannot know
+struct ShadedProgram {
+    program: glow::Program,
+    uniforms: Uniforms,
+    /// the target's own size, which the placed position divides by
+    buffer_size: Option<glow::UniformLocation>,
+    /// whether the buffer's rows run from its top
+    flip: Option<glow::UniformLocation>,
 }
 
 impl Drop for OpenGlRasterizer {
@@ -926,6 +1059,14 @@ impl Drop for OpenGlRasterizer {
             self.gl.delete_texture(self.dummy_texture);
             self.gl.delete_vertex_array(self.vertex_array);
             self.gl.delete_buffer(self.vertices);
+            self.gl.delete_buffer(self.shading_buffer);
+            self.gl.delete_buffer(self.inputs_buffer);
+            self.gl.delete_buffer(self.indices_buffer);
+            for (_, made) in self.shaded_programs.drain() {
+                if let Ok(made) = made {
+                    self.gl.delete_program(made.program);
+                }
+            }
             self.gl.delete_program(self.program);
             self.gl.delete_program(self.transfer_program);
             self.gl.delete_program(self.upright_program);
@@ -995,6 +1136,36 @@ impl OpenGlRasterizer {
             let vertices = match gl.create_buffer() {
                 Ok(vertices) => vertices,
                 Err(error) => {
+                    gl.delete_vertex_array(vertex_array);
+                    gl.delete_program(program);
+                    return Err(error.to_string());
+                }
+            };
+            let shading_buffer = match gl.create_buffer() {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    gl.delete_buffer(vertices);
+                    gl.delete_vertex_array(vertex_array);
+                    gl.delete_program(program);
+                    return Err(error.to_string());
+                }
+            };
+            let inputs_buffer = match gl.create_buffer() {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    gl.delete_buffer(vertices);
+                    gl.delete_buffer(shading_buffer);
+                    gl.delete_vertex_array(vertex_array);
+                    gl.delete_program(program);
+                    return Err(error.to_string());
+                }
+            };
+            let indices_buffer = match gl.create_buffer() {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    gl.delete_buffer(vertices);
+                    gl.delete_buffer(shading_buffer);
+                    gl.delete_buffer(inputs_buffer);
                     gl.delete_vertex_array(vertex_array);
                     gl.delete_program(program);
                     return Err(error.to_string());
@@ -1071,6 +1242,9 @@ impl OpenGlRasterizer {
             let dummy_texture = match gl.create_texture() {
                 Ok(texture) => texture,
                 Err(error) => {
+                    gl.delete_buffer(indices_buffer);
+                    gl.delete_buffer(inputs_buffer);
+                    gl.delete_buffer(shading_buffer);
                     gl.delete_buffer(vertices);
                     gl.delete_vertex_array(vertex_array);
                     gl.delete_texture(lookup_tables);
@@ -1104,52 +1278,7 @@ impl OpenGlRasterizer {
                 glow::PixelUnpackData::Slice(Some(&[0u8, 0, 0, 255])),
             );
             gl.bind_texture(glow::TEXTURE_2D, None);
-            let uniforms = Uniforms {
-                depth_scale: gl.get_uniform_location(program, "depth_scale"),
-                depth_offset: gl.get_uniform_location(program, "depth_offset"),
-                w_buffer: gl.get_uniform_location(program, "w_buffer"),
-                alpha_test: gl.get_uniform_location(program, "alpha_test"),
-                alpha_function: gl.get_uniform_location(program, "alpha_function"),
-                alpha_reference: gl.get_uniform_location(program, "alpha_reference"),
-                tex_enabled: gl.get_uniform_location(program, "tex_enabled[0]"),
-                tex_image: std::array::from_fn(|unit| {
-                    gl.get_uniform_location(program, &format!("tex_image{unit}"))
-                }),
-                tex_size: std::array::from_fn(|unit| {
-                    gl.get_uniform_location(program, &format!("tex_size[{unit}]"))
-                }),
-                tex_lod: std::array::from_fn(|unit| {
-                    gl.get_uniform_location(program, &format!("tex_lod[{unit}]"))
-                }),
-                tex_wrap_s: gl.get_uniform_location(program, "tex_wrap_s[0]"),
-                tex_wrap_t: gl.get_uniform_location(program, "tex_wrap_t[0]"),
-                tex_border: gl.get_uniform_location(program, "tex_border[0]"),
-                tex_filter: gl.get_uniform_location(program, "tex_filter[0]"),
-                tex0_projected: gl.get_uniform_location(program, "tex0_projected"),
-                tev_active: gl.get_uniform_location(program, "tev_active"),
-                tev_color_sources: gl.get_uniform_location(program, "tev_color_sources[0]"),
-                tev_alpha_sources: gl.get_uniform_location(program, "tev_alpha_sources[0]"),
-                tev_color_operands: gl.get_uniform_location(program, "tev_color_operands[0]"),
-                tev_alpha_operands: gl.get_uniform_location(program, "tev_alpha_operands[0]"),
-                tev_color_ops: gl.get_uniform_location(program, "tev_color_ops[0]"),
-                tev_alpha_ops: gl.get_uniform_location(program, "tev_alpha_ops[0]"),
-                tev_constants: gl.get_uniform_location(program, "tev_constants[0]"),
-                tev_color_scales: gl.get_uniform_location(program, "tev_color_scales[0]"),
-                tev_alpha_scales: gl.get_uniform_location(program, "tev_alpha_scales[0]"),
-                tev_passthrough: gl.get_uniform_location(program, "tev_passthrough[0]"),
-                tev_update_mask: gl.get_uniform_location(program, "tev_update_mask"),
-                tev_buffer_color: gl.get_uniform_location(program, "tev_buffer_color"),
-                lighting_active: gl.get_uniform_location(program, "lighting_active"),
-                light_head: gl.get_uniform_location(program, "light_head"),
-                light_flags: gl.get_uniform_location(program, "light_flags"),
-                light_lookups: gl.get_uniform_location(program, "light_lookups[0]"),
-                light_ambient: gl.get_uniform_location(program, "light_ambient"),
-                light_data: gl.get_uniform_location(program, "light_data[0]"),
-                light_meta: gl.get_uniform_location(program, "light_meta[0]"),
-                fog_active: gl.get_uniform_location(program, "fog_active"),
-                fog_flip: gl.get_uniform_location(program, "fog_flip"),
-                fog_color: gl.get_uniform_location(program, "fog_color"),
-            };
+            let uniforms = Uniforms::for_program(&gl, program);
 
             // the transfer and upright programs, and the objects their
             // fullscreen passes share
@@ -1185,6 +1314,9 @@ impl OpenGlRasterizer {
                 match result {
                     Ok(made) => made,
                     Err(error) => {
+                        gl.delete_buffer(indices_buffer);
+                        gl.delete_buffer(inputs_buffer);
+                        gl.delete_buffer(shading_buffer);
                         gl.delete_buffer(vertices);
                         gl.delete_vertex_array(vertex_array);
                         gl.delete_texture(lookup_tables);
@@ -1215,6 +1347,10 @@ impl OpenGlRasterizer {
                 last_tev: None,
                 lookup_tables,
                 dummy_texture,
+                shaded_programs: HashMap::new(),
+                shading_buffer,
+                inputs_buffer,
+                indices_buffer,
                 lut_tables_id: u64::MAX,
                 lut_tables_changed: [u64::MAX; crate::lighting::TABLES],
                 lut_fog_generation: u64::MAX,
@@ -1224,7 +1360,10 @@ impl OpenGlRasterizer {
         }
     }
 
-    pub(super) fn draw<M: GpuMemory>(
+    /// everything a draw runs once its vertices are ready: the surface, the
+    /// output merger's state, the textures and uniforms, then the vertices
+    /// themselves, placed by the CPU or shaded by the translated program
+    fn submit<M: GpuMemory>(
         &mut self,
         memory: &mut M,
         target: &ColorTarget,
@@ -1233,11 +1372,13 @@ impl OpenGlRasterizer {
         output: &OutputState,
         textures: &TextureSetup,
         fragment: &FragmentSetup,
-        triangles: &[[Screen; 3]],
+        vertices: VertexSource,
     ) -> Result<(), String> {
-        if triangles.is_empty() || target.right <= target.left || target.top <= target.bottom {
-            return Ok(());
-        }
+        let (program, uniforms) = match &vertices {
+            VertexSource::Placed { uniforms, .. } => (self.program, uniforms.clone()),
+            VertexSource::Shaded { program, uniforms, .. } => (*program, uniforms.clone()),
+        };
+
         let (width, height) = (target.buffer_width, target.buffer_height);
         let bytes_per_pixel = target.format.bytes_per_pixel() as u32;
         let pixels = width
@@ -1331,61 +1472,15 @@ impl OpenGlRasterizer {
             None
         };
 
-        let mut vertices = Vec::with_capacity(triangles.len() * 3 * 24);
-        let set2 = if textures.texture2_uses_coord1 { 1 } else { 2 };
-        for triangle in triangles {
-            // q and -q are the same orientation but halfway between them isn't,
-            // so the quaternions all go to the first vertex's side, the way the
-            // software rasterizer turns them before it interpolates
-            let first = triangle[0].quaternion_over_w;
-            let hemisphere = |vertex: &Screen| {
-                let same = (0..4)
-                    .map(|i| vertex.quaternion_over_w[i] * first[i])
-                    .sum::<f32>();
-                if same < 0.0 {
-                    vertex.quaternion_over_w.map(|component| -component)
-                } else {
-                    vertex.quaternion_over_w
-                }
-            };
-            let quaternions = [first, hemisphere(&triangle[1]), hemisphere(&triangle[2])];
-            for (vertex, quaternion_over_w) in triangle.iter().zip(quaternions) {
-                let inverse_w = vertex.inv_w;
-                vertices.extend([
-                    (2.0 * vertex.x / width as f32 - 1.0) / inverse_w,
-                    (2.0 * vertex.y / height as f32 - 1.0) / inverse_w,
-                    inverse_w,
-                    vertex.z,
-                ]);
-                vertices.extend(vertex.color_over_w.map(|component| component / inverse_w));
-                let [u0, v0] = vertex.texcoords_over_w[0];
-                let [u1, v1] = vertex.texcoords_over_w[1];
-                let [u2, v2] = vertex.texcoords_over_w[set2];
-                vertices.extend([
-                    u0 / inverse_w,
-                    v0 / inverse_w,
-                    u1 / inverse_w,
-                    v1 / inverse_w,
-                    u2 / inverse_w,
-                    v2 / inverse_w,
-                    vertex.texcoord0_w_over_w / inverse_w,
-                    0.0,
-                ]);
-                vertices.extend(quaternion_over_w.map(|component| component / inverse_w));
-                vertices.extend([
-                    vertex.view_over_w[0] / inverse_w,
-                    vertex.view_over_w[1] / inverse_w,
-                    vertex.view_over_w[2] / inverse_w,
-                    0.0,
-                ]);
-            }
-        }
-        let vertex_bytes = bytemuck::cast_slice(&vertices);
 
         // the textures go into GL before the draw, each uploaded once for as
         // long as the CPU decoder hands out the same texels
         let bound = self.bind_textures(textures)?;
-        let tev_changed = self.last_tev.as_ref() != Some(&textures.tev);
+        // a shaded draw runs its own program, whose uniforms hold none of what
+        // the last draw's program was set to, so its combiners, lighting and
+        // fog arrays go over however unchanged the state looks
+        let own_program = matches!(vertices, VertexSource::Shaded { .. });
+        let tev_changed = own_program || self.last_tev.as_ref() != Some(&textures.tev);
         // the lighting and fog tables into the LUT texture, a changed row only,
         // then the words the lighting state packed into, only when a draw
         // decoded different ones
@@ -1395,9 +1490,13 @@ impl OpenGlRasterizer {
             lighting.pack(&mut words);
             words
         });
-        let lighting_changed = lighting_words != self.last_lighting;
+        let lighting_changed = own_program || lighting_words != self.last_lighting;
         let fog_state = fragment.fog.map(|fog| (fog.color, fog.flip));
-        let fog_update = fog_state.filter(|fog| self.last_fog.as_ref() != Some(fog));
+        let fog_update = if own_program {
+            fog_state
+        } else {
+            fog_state.filter(|fog| self.last_fog.as_ref() != Some(fog))
+        };
 
         let framebuffer_complete = unsafe {
             let gl = &self.gl;
@@ -1528,29 +1627,33 @@ impl OpenGlRasterizer {
                         gl.disable(glow::BLEND);
                     }
                 }
-                gl.use_program(Some(self.program));
-                gl.bind_vertex_array(Some(self.vertex_array));
-                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vertices));
-                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, vertex_bytes, glow::STREAM_DRAW);
-                if let Some(location) = &self.uniforms.depth_scale {
+                // placed vertices come thru the vertex array; the shaded draws
+                // read their inputs out of storage buffers, so no attributes
+                let vertex_array = match vertices {
+                    VertexSource::Placed { .. } => self.vertex_array,
+                    VertexSource::Shaded { .. } => self.utility_vertex_array,
+                };
+                gl.use_program(Some(program));
+                gl.bind_vertex_array(Some(vertex_array));
+                if let Some(location) = &uniforms.depth_scale {
                     gl.uniform_1_f32(Some(location), depth_map.scale);
                 }
-                if let Some(location) = &self.uniforms.depth_offset {
+                if let Some(location) = &uniforms.depth_offset {
                     gl.uniform_1_f32(Some(location), depth_map.offset);
                 }
-                if let Some(location) = &self.uniforms.w_buffer {
+                if let Some(location) = &uniforms.w_buffer {
                     gl.uniform_1_i32(Some(location), depth_map.w_buffer as i32);
                 }
-                if let Some(location) = &self.uniforms.alpha_test {
+                if let Some(location) = &uniforms.alpha_test {
                     gl.uniform_1_i32(Some(location), output.alpha_test.is_some() as i32);
                 }
-                if let Some(location) = &self.uniforms.alpha_function {
+                if let Some(location) = &uniforms.alpha_function {
                     gl.uniform_1_i32(
                         Some(location),
                         output.alpha_test.map_or(1, |(function, _)| function as i32),
                     );
                 }
-                if let Some(location) = &self.uniforms.alpha_reference {
+                if let Some(location) = &uniforms.alpha_reference {
                     gl.uniform_1_i32(
                         Some(location),
                         output
@@ -1558,23 +1661,23 @@ impl OpenGlRasterizer {
                             .map_or(0, |(_, reference)| reference as i32),
                     );
                 }
-                self.set_texture_uniforms(textures, tev_changed);
-                if let Some(location) = &self.uniforms.lighting_active {
+                self.set_texture_uniforms(&uniforms, textures, tev_changed);
+                if let Some(location) = &uniforms.lighting_active {
                     gl.uniform_1_i32(Some(location), fragment.lighting.is_some() as i32);
                 }
                 if lighting_changed {
                     if let Some(words) = &lighting_words {
-                        self.set_lighting_uniforms(words);
+                        self.set_lighting_uniforms(&uniforms, words);
                     }
                 }
-                if let Some(location) = &self.uniforms.fog_active {
+                if let Some(location) = &uniforms.fog_active {
                     gl.uniform_1_i32(Some(location), fragment.fog.is_some() as i32);
                 }
                 if let Some((color, flip)) = &fog_update {
-                    if let Some(location) = &self.uniforms.fog_flip {
+                    if let Some(location) = &uniforms.fog_flip {
                         gl.uniform_1_i32(Some(location), *flip as i32);
                     }
-                    if let Some(location) = &self.uniforms.fog_color {
+                    if let Some(location) = &uniforms.fog_color {
                         gl.uniform_3_f32_slice(Some(location), color);
                     }
                 }
@@ -1635,7 +1738,56 @@ impl OpenGlRasterizer {
                         &setup.border,
                     );
                 }
-                gl.draw_arrays(glow::TRIANGLES, 0, (vertices.len() / 24) as i32);
+                match vertices {
+                    VertexSource::Placed { floats, .. } => {
+                        gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vertices));
+                        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&floats), glow::STREAM_DRAW);
+                        gl.draw_arrays(glow::TRIANGLES, 0, (floats.len() / 24) as i32);
+                    }
+                    VertexSource::Shaded { program, uniforms, buffer_size, flip, flipped, words, inputs, indices, count, cull } => {
+                        let _ = (program, uniforms);
+                        if let Some(location) = buffer_size {
+                            gl.uniform_2_f32_slice(Some(&location), &[width as f32, height as f32]);
+                        }
+                        if let Some(location) = flip {
+                            gl.uniform_1_i32(Some(&location), flipped as i32);
+                        }
+                        // the vertex stage reads its uniforms and state out of one
+                        // storage block and the input registers out of another
+                        gl.bind_buffer(glow::SHADER_STORAGE_BUFFER, Some(self.shading_buffer));
+                        gl.buffer_data_u8_slice(
+                            glow::SHADER_STORAGE_BUFFER,
+                            bytemuck::cast_slice(&words),
+                            glow::STREAM_DRAW,
+                        );
+                        gl.bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 6, Some(self.shading_buffer));
+                        gl.bind_buffer(glow::SHADER_STORAGE_BUFFER, Some(self.inputs_buffer));
+                        gl.buffer_data_u8_slice(glow::SHADER_STORAGE_BUFFER, &inputs, glow::STREAM_DRAW);
+                        gl.bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 7, Some(self.inputs_buffer));
+                        gl.bind_buffer(glow::SHADER_STORAGE_BUFFER, None);
+                        // the PICA's volume and winding, which GL clips and culls by
+                        gl.enable(glow::CLIP_DISTANCE0);
+                        if let Some(front_face) = cull {
+                            gl.enable(glow::CULL_FACE);
+                            gl.front_face(front_face);
+                            gl.cull_face(glow::BACK);
+                        }
+                        match indices {
+                            Some((bytes, elements)) => {
+                                gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.indices_buffer));
+                                gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, &bytes, glow::STREAM_DRAW);
+                                gl.draw_elements(glow::TRIANGLES, elements as i32, glow::UNSIGNED_SHORT, 0);
+                            }
+                            None => {
+                                gl.draw_arrays(glow::TRIANGLES, 0, count as i32);
+                            }
+                        }
+                        gl.disable(glow::CLIP_DISTANCE0);
+                        gl.disable(glow::CULL_FACE);
+                        gl.bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 6, None);
+                        gl.bind_buffer_base(glow::SHADER_STORAGE_BUFFER, 7, None);
+                    }
+                }
                 gl.bind_vertex_array(None);
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 gl.disable(glow::SCISSOR_TEST);
@@ -1670,9 +1822,249 @@ impl OpenGlRasterizer {
         Ok(())
     }
 
+
+    /// a draw the GL shades itself: the PICA vertex shader runs translated off
+    /// the program the title uploaded, its inputs ride a storage buffer, and GL
+    /// clips and culls the triangles it makes before the fragment stage runs.
+    /// Returns the triangles the draw names
+    pub(super) fn draw_shaded<M: GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        target: &ColorTarget,
+        depth: Option<&DepthStencil>,
+        depth_map: DepthMap,
+        output: &OutputState,
+        textures: &TextureSetup,
+        fragment: &FragmentSetup,
+        shaded: &ShadedDraw,
+    ) -> Result<u32, String> {
+        if shaded.inputs.is_empty() || target.right <= target.left || target.top <= target.bottom {
+            return Ok(0);
+        }
+        // the program, compiled once per fingerprint, entry point and semantics,
+        // or the reason it cannot run, which puts the draw back on the CPU
+        let key: ShadedKey = (
+            shaded.unit.fingerprint(),
+            shaded.unit.entry_point,
+            shaded.semantics,
+        );
+        let made = match self.shaded_programs.get(&key) {
+            Some(Ok(made)) => made,
+            Some(Err(error)) => return Err(error.clone()),
+            None => {
+                let made_program = unsafe { self.compile_shaded_program(shaded.unit, shaded.semantics) };
+                self.shaded_programs.insert(key, made_program);
+                match self.shaded_programs.get(&key).expect("just inserted") {
+                    Ok(made) => made,
+                    Err(error) => return Err(error.clone()),
+                }
+            }
+        };
+
+        // the words the Shading block holds: the uniforms, the semantics, the
+        // viewport, and where each input register the program reads finds its
+        // attribute, which is its own place in the input block
+        let unit = shaded.unit;
+        let read = unit.inputs_read();
+        let mut reads = [0usize; crate::shader::INPUT_REGISTERS];
+        let mut found = 0;
+        for register in (0..crate::shader::INPUT_REGISTERS).filter(|r| read & (1 << r) != 0) {
+            reads[found] = register;
+            found += 1;
+        }
+        let registers_read = &reads[..found];
+        let stride = (registers_read.len() * 16) as u32;
+        let mut attributes = [[0u32; 4]; crate::shader::INPUT_REGISTERS];
+        for (slot, &register) in registers_read.iter().enumerate() {
+            attributes[register] = [0, stride, (slot as u32 * 16) | 3 << 8 | 4 << 16, 0];
+        }
+        let mut words = Vec::with_capacity(crate::shader::glsl::SHADING_WORDS);
+        words.extend(unit.float_uniforms.as_flattened().iter().map(|value| value.to_bits()));
+        for [count, start, step, _] in unit.int_uniforms {
+            words.extend([count as u32, start as u32, step as i8 as u32, 0]);
+        }
+        words.extend([unit.bool_uniforms as u32, unit.entry_point, 0, 0]);
+        words.extend(shaded.semantics);
+        words.extend([depth_map.scale.to_bits(), depth_map.offset.to_bits(), 0, 0]);
+        let (x, y, width, height) = shaded.viewport;
+        words.extend([x, y, width, height].map(f32::to_bits));
+        words.extend_from_slice(attributes.as_flattened());
+        // no defaults: the decoded inputs carry every register's value
+        words.resize(crate::shader::glsl::SHADING_WORDS, 0);
+
+        // the input registers each vertex carries, four floats a register
+        let mut inputs = Vec::with_capacity(shaded.inputs.len() * registers_read.len() * 16);
+        for input in shaded.inputs {
+            for &register in registers_read {
+                for value in input[register] {
+                    inputs.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+
+        // the triangles the topology names, every one wound like the first, so
+        // culling judges the winding the PICA does instead of GL's alternation
+        let count = shaded.order.map_or(shaded.inputs.len(), <[usize]>::len);
+        let mut indices: Vec<u16> = Vec::new();
+        for (a, b, c) in super::assemble(shaded.topology, count) {
+            let at = |i: usize| shaded.order.map_or(i, |order| order[i]);
+            indices.extend([at(a) as u16, at(b) as u16, at(c) as u16]);
+        }
+        let triangles = (indices.len() / 3) as u32;
+        let indices = (!indices.is_empty()).then(|| {
+            let bytes = bytemuck::cast_slice::<u16, u8>(&indices).to_vec();
+            (bytes, indices.len() as u32)
+        });
+
+        // the PICA keeps clockwise triangles (cull 1) or counterclockwise ones
+        // (cull 2) seen w/ y pointing up, which GL's own window counts; an upside
+        // down buffer's flipped rows turn every winding over
+        let cull = match (shaded.cull, shaded.flip) {
+            (0, _) | (_, _) if shaded.cull == 0 => None,
+            (1, false) | (2, true) => Some(glow::CW),
+            (2, false) | (1, true) => Some(glow::CCW),
+            _ => None,
+        };
+
+        self.submit(
+            memory,
+            target,
+            depth,
+            depth_map,
+            output,
+            textures,
+            fragment,
+            VertexSource::Shaded {
+                program: made.program,
+                uniforms: made.uniforms.clone(),
+                buffer_size: made.buffer_size,
+                flip: made.flip,
+                flipped: shaded.flip,
+                words,
+                inputs,
+                indices,
+                count,
+                cull,
+            },
+        )?;
+        Ok(triangles)
+    }
+
+    /// the vertex stage for one program: the title's program translated to GLSL,
+    /// linked w/ the fragment stage the draws share, its samplers pointed at the
+    /// units and the two per-draw uniforms found
+    unsafe fn compile_shaded_program(
+        &mut self,
+        unit: &crate::shader::ShaderUnit,
+        semantics: [u32; crate::shader::glsl::SEMANTICS],
+    ) -> Result<ShadedProgram, String> {
+        let glsl = unit
+            .translate_gl(&semantics)
+            .map_err(|error| format!("the vertex shader would not translate, {error}"))?;
+        let program = unsafe { link_program(&self.gl, &glsl, FRAGMENT_SHADER)? };
+        unsafe {
+            let gl = &self.gl;
+            gl.use_program(Some(program));
+            for texture in 0..3 {
+                if let Some(location) = gl.get_uniform_location(program, &format!("tex_image{texture}")) {
+                    gl.uniform_1_i32(Some(&location), texture as i32);
+                }
+            }
+            if let Some(location) = gl.get_uniform_location(program, "lut_image") {
+                gl.uniform_1_i32(Some(&location), 3);
+            }
+            Ok(ShadedProgram {
+                program,
+                uniforms: Uniforms::for_program(gl, program),
+                buffer_size: gl.get_uniform_location(program, "buffer_size"),
+                flip: gl.get_uniform_location(program, "flip"),
+            })
+        }
+    }
+
     /// the lighting and fog tables into the shared LUT texture: a table with a
     /// changed entry uploads its row again, the fog when its table changed, and
     /// the texture stays bound to unit 3 for the draw
+    /// a draw the CPU already shaded, clipped and placed: the placed triangles
+    /// go in as six vec4s a vertex and GL rasterizes them
+    pub(super) fn draw<M: GpuMemory>(
+        &mut self,
+        memory: &mut M,
+        target: &ColorTarget,
+        depth: Option<&DepthStencil>,
+        depth_map: DepthMap,
+        output: &OutputState,
+        textures: &TextureSetup,
+        fragment: &FragmentSetup,
+        triangles: &[[Screen; 3]],
+    ) -> Result<(), String> {
+        if triangles.is_empty() || target.right <= target.left || target.top <= target.bottom {
+            return Ok(());
+        }
+        let (width, height) = (target.buffer_width, target.buffer_height);
+        let mut floats = Vec::with_capacity(triangles.len() * 3 * 24);
+        let set2 = if textures.texture2_uses_coord1 { 1 } else { 2 };
+        for triangle in triangles {
+            // q and -q are the same orientation but halfway between them isn't,
+            // so the quaternions all go to the first vertex's side, the way the
+            // software rasterizer turns them before it interpolates
+            let first = triangle[0].quaternion_over_w;
+            let hemisphere = |vertex: &Screen| {
+                let same = (0..4)
+                    .map(|i| vertex.quaternion_over_w[i] * first[i])
+                    .sum::<f32>();
+                if same < 0.0 {
+                    vertex.quaternion_over_w.map(|component| -component)
+                } else {
+                    vertex.quaternion_over_w
+                }
+            };
+            let quaternions = [first, hemisphere(&triangle[1]), hemisphere(&triangle[2])];
+            for (vertex, quaternion_over_w) in triangle.iter().zip(quaternions) {
+                let inverse_w = vertex.inv_w;
+                floats.extend([
+                    (2.0 * vertex.x / width as f32 - 1.0) / inverse_w,
+                    (2.0 * vertex.y / height as f32 - 1.0) / inverse_w,
+                    inverse_w,
+                    vertex.z,
+                ]);
+                floats.extend(vertex.color_over_w.map(|component| component / inverse_w));
+                let [u0, v0] = vertex.texcoords_over_w[0];
+                let [u1, v1] = vertex.texcoords_over_w[1];
+                let [u2, v2] = vertex.texcoords_over_w[set2];
+                floats.extend([
+                    u0 / inverse_w,
+                    v0 / inverse_w,
+                    u1 / inverse_w,
+                    v1 / inverse_w,
+                    u2 / inverse_w,
+                    v2 / inverse_w,
+                    vertex.texcoord0_w_over_w / inverse_w,
+                    0.0,
+                ]);
+                floats.extend(quaternion_over_w.map(|component| component / inverse_w));
+                floats.extend([
+                    vertex.view_over_w[0] / inverse_w,
+                    vertex.view_over_w[1] / inverse_w,
+                    vertex.view_over_w[2] / inverse_w,
+                    0.0,
+                ]);
+            }
+        }
+        self.submit(
+            memory,
+            target,
+            depth,
+            depth_map,
+            output,
+            textures,
+            fragment,
+            VertexSource::Placed {
+                floats,
+                uniforms: self.uniforms.clone(),
+            },
+        )
+    }
     fn upload_luts(
         &mut self,
         lighting: Option<&crate::lighting::Lighting>,
@@ -1753,10 +2145,9 @@ impl OpenGlRasterizer {
 
     /// the lighting's words onto the shader's uniforms, the vec4s through the
     /// bits they pack, the flags and numbers gathered out of each light's block
-    fn set_lighting_uniforms(&self, words: &[u32]) {
+    fn set_lighting_uniforms(&self, uniforms: &Uniforms, words: &[u32]) {
         unsafe {
             let gl = &self.gl;
-            let uniforms = &self.uniforms;
             if let Some(location) = &uniforms.light_head {
                 gl.uniform_4_u32_slice(Some(location), &words[0..4]);
             }
@@ -1780,7 +2171,9 @@ impl OpenGlRasterizer {
                 // integer metadata the flags ride separately, and the shader
                 // strides light_data by eight vec4s of the data alone
                 let data: Vec<f32> = words[40..]
-                    .chunks_exact(36)
+                    .as_chunks::<36>()
+                    .0
+                    .iter()
                     .flat_map(|light| light[..32].iter())
                     .map(|word| f32::from_bits(*word))
                     .collect();
@@ -1947,10 +2340,9 @@ impl OpenGlRasterizer {
     /// the texture units' and combiners' uniforms for one draw. The combiner
     /// arrays only go over when they changed, most draws keeping the last
     /// draw's environment
-    unsafe fn set_texture_uniforms(&self, textures: &TextureSetup, tev_changed: bool) {
+    unsafe fn set_texture_uniforms(&self, uniforms: &Uniforms, textures: &TextureSetup, tev_changed: bool) {
         unsafe {
             let gl = &self.gl;
-            let uniforms = &self.uniforms;
             let enabled: [i32; 3] =
                 std::array::from_fn(|unit| textures.units[unit].is_some() as i32);
             if let Some(location) = &uniforms.tex_enabled {

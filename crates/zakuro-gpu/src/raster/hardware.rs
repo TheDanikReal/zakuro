@@ -125,10 +125,6 @@ const PROGRAM_BYTES: u64 = ((PROGRAM_SIZE + DESCRIPTOR_SIZE) * 4) as u64;
 /// and where each input register finds its attribute and what it reads w/o one
 const SHADING_WORDS: usize = 96 * 4 + 4 * 4 + 4 + 24 + 4 + 4 + 16 * 4 + 16 * 4;
 const SHADING_SIZE: u64 = (SHADING_WORDS * 4) as u64;
-/// a semantic no output register carries, which takes its default
-pub(super) const MISSING: u32 = u32::MAX;
-/// a semantic in an output attribute past the enabled registers, zero
-pub(super) const ZERO: u32 = u32::MAX - 1;
 
 /// where each combiner stage's registers start
 const STAGE_REGISTERS: [usize; 6] = [0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8];

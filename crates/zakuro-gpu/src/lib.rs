@@ -28,6 +28,16 @@ pub use backend::{layout, place, GpuScreen, Overlay, OverlayMesh, OverlayTexture
 pub use renderer::{DrawCall, Renderer, RendererKind, SoftwareRenderer};
 #[cfg(feature = "vulkan")]
 pub use device::SharedDevice;
+#[cfg(feature = "opengl")]
+#[derive(Clone)]
+pub struct SharedOpenGlContext(pub(crate) std::sync::Arc<glow::Context>);
+
+#[cfg(feature = "opengl")]
+impl std::fmt::Debug for SharedOpenGlContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedOpenGlContext")
+    }
+}
 
 /// how the GPU reaches guest memory
 pub trait GpuMemory {
@@ -335,6 +345,10 @@ impl Gpu {
                 log::error!("the GPU could not write back a buffer, {error}");
             }
         }
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            renderer.sync(memory, address, length as u32, true);
+        }
 
         let bytes = value.to_le_bytes();
         let pattern = &bytes[..if matches!(width, 2 | 3) { width as usize } else { 4 }];
@@ -447,6 +461,33 @@ impl Gpu {
                 output_format,
             };
             match hardware.display_transfer(memory, &transfer) {
+                Ok(true) => {
+                    self.transfers += 1;
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => log::error!("the GPU could not transfer a buffer, {error}"),
+            }
+        }
+        // and so does the OpenGL one, out of a surface it drew or an earlier
+        // transfer wrote, the output staying in a surface it keeps
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            let transfer = raster::opengl::Transfer {
+                input: input_base,
+                output: output_base,
+                input_width,
+                output_width,
+                output_height,
+                copy: (copy_width, copy_height),
+                scale: (scale_x, scale_y),
+                flip: flip_vertically,
+                input_linear,
+                output_tiled,
+                input_format,
+                output_format,
+            };
+            match renderer.display_transfer(memory, &transfer) {
                 Ok(true) => {
                     self.transfers += 1;
                     return;
@@ -680,9 +721,21 @@ impl Gpu {
         Ok(name)
     }
 
+    /// uses OpenGL for the supported untextured, vertex-colored rasterization path
+    #[cfg(feature = "opengl")]
+    pub fn enable_opengl_renderer(&mut self, context: SharedOpenGlContext) -> Result<String, String> {
+        let renderer = unsafe { raster::opengl::OpenGlRasterizer::new(context)? };
+        self.resources.opengl = Some(renderer);
+        Ok("OpenGL 4.3 at 1x, shown straight from the GPU".to_owned())
+    }
+
     /// draws the texture pack's pictures in place of the textures they replace, or no pack's
-    /// only the host's GPU draws them, so a pack waits for enable_hardware_renderer, and says if it's drawn
+    /// only the Vulkan renderer draws them so far, so a pack waits for enable_hardware_renderer, and says if it's drawn
     pub fn set_texture_pack(&mut self, pack: Option<std::sync::Arc<pack::Pack>>) -> bool {
+        // the replacements ride the Vulkan renderer alone: neither the OpenGL
+        // rasterizer nor the software fallback samples a pack's pictures yet, so
+        // taking a pack there would report it drawn while the guest texels stay
+        // on screen. Says whether the pack is actually drawn.
         #[cfg(feature = "vulkan")]
         let pack = pack.filter(|_| self.resources.hardware.is_some());
         #[cfg(not(feature = "vulkan"))]
@@ -698,6 +751,10 @@ impl Gpu {
         if self.resources.hardware.is_some() {
             return true;
         }
+        #[cfg(feature = "opengl")]
+        if self.resources.opengl.is_some() {
+            return true;
+        }
         false
     }
 
@@ -706,6 +763,11 @@ impl Gpu {
         #[cfg(feature = "vulkan")]
         if let Some(hardware) = self.resources.hardware.as_ref() {
             return hardware.direct();
+        }
+        // the OpenGL presenter always shares the renderer's context
+        #[cfg(feature = "opengl")]
+        if self.resources.opengl.is_some() {
+            return true;
         }
         false
     }
@@ -720,7 +782,14 @@ impl Gpu {
                 Err(error) => log::error!("the GPU could not show a screen, {error}"),
             }
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            match renderer.screen_image(screen) {
+                Ok(image) => return image,
+                Err(error) => log::error!("the GPU could not show a screen, {error}"),
+            }
+        }
+        #[cfg(not(any(feature = "vulkan", feature = "opengl")))]
         let _ = screen;
         None
     }
@@ -777,7 +846,13 @@ impl Gpu {
         if let Some(hardware) = self.resources.hardware.as_mut() {
             return hardware.upright_picture(screen, between);
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            if let Some(picture) = renderer.upright_picture(screen, between) {
+                return Some(picture);
+            }
+        }
+        #[cfg(not(any(feature = "vulkan", feature = "opengl")))]
         let _ = (screen, between);
         None
     }
@@ -799,7 +874,11 @@ impl Gpu {
         if let Some(hardware) = self.resources.hardware.as_mut() {
             return hardware.screen(addr, size, stride, format, guest);
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            return renderer.screen(addr, size, stride, format, guest);
+        }
+        #[cfg(not(any(feature = "vulkan", feature = "opengl")))]
         let _ = (addr, size, stride, format, guest);
         None
     }
@@ -827,6 +906,10 @@ impl Gpu {
                 log::error!("the GPU could not write back a buffer, {error}");
             }
         }
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            renderer.sync(memory, addr, len, true);
+        }
         #[cfg(not(feature = "vulkan"))]
         let _ = (memory, addr, len);
     }
@@ -839,6 +922,10 @@ impl Gpu {
             if let Err(error) = hardware.sync_depth(memory, addr, len) {
                 log::error!("the GPU could not write back a buffer, {error}");
             }
+        }
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.resources.opengl.as_mut() {
+            renderer.sync(memory, addr, len, false);
         }
         #[cfg(not(feature = "vulkan"))]
         let _ = (memory, addr, len);

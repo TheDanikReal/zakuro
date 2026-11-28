@@ -118,6 +118,21 @@ impl Stage {
             && self.color_scale == 1.0
             && self.alpha_scale == 1.0
     }
+
+    /// the vertex color alone comes out, the state the OpenGL path used to
+    /// require and its differential tests still pin
+    #[cfg(test)]
+    fn is_vertex_color_passthrough(&self) -> bool {
+        let primary_or_previous = |source| matches!(source, Source::PrimaryColor | Source::Previous);
+        self.color_op == Operation::Replace
+            && self.alpha_op == Operation::Replace
+            && primary_or_previous(self.color_sources[0])
+            && primary_or_previous(self.alpha_sources[0])
+            && self.color_operands[0] == 0
+            && self.alpha_operands[0] == 0
+            && self.color_scale == 1.0
+            && self.alpha_scale == 1.0
+    }
 }
 
 impl TexEnv {
@@ -186,6 +201,11 @@ impl TexEnv {
                     || (stage.color_op != Operation::Dot3Rgba
                         && stage.alpha_sources[..stage.alpha_op.inputs()].iter().any(lit)))
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_vertex_color_passthrough(&self) -> bool {
+        self.stages.iter().all(Stage::is_vertex_color_passthrough)
     }
 
     /// runs every stage for one fragment
@@ -266,6 +286,110 @@ impl LastTexEnv {
             self.read = read;
         }
         self.tex_env.as_ref().expect("decoded above")
+    }
+}
+
+/// the combiners as an OpenGL fragment shader runs them, six stages of uniform
+/// arrays, so one uber-shader takes every environment without recompiling
+///
+/// the source and operation numbers below are the shader's own, not the PICA's
+/// register encodings; the shader mirrors `apply`'s picking and combining from them
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct TevUniforms {
+    /// six stages of three color inputs, flat: stage i's input j at [i * 3 + j]
+    pub color_sources: [u32; 18],
+    pub alpha_sources: [u32; 18],
+    /// the operand selectors the shader folds each input through
+    pub color_operands: [u32; 18],
+    pub alpha_operands: [u32; 18],
+    pub color_ops: [u32; 6],
+    pub alpha_ops: [u32; 6],
+    pub constants: [[f32; 4]; 6],
+    pub color_scales: [f32; 6],
+    pub alpha_scales: [f32; 6],
+    /// a stage that hands the previous result on untouched, one flag per stage
+    pub passthrough: [u32; 6],
+    /// bits 0 to 3, stages 0 to 3 writing their color into the buffer,
+    /// bits 4 to 7 their alpha
+    pub update_mask: u32,
+    pub buffer_color: [f32; 4],
+    /// every stage passes the value along, a draw whose combiners only carry
+    /// the vertex color; the shader skips the whole loop for it
+    pub all_passthrough: bool,
+}
+
+impl TevUniforms {
+    /// the shader's source numbers
+    const PRIMARY_COLOR: u32 = 0;
+    const PRIMARY_FRAGMENT: u32 = 8;
+    const SECONDARY_FRAGMENT: u32 = 9;
+    const TEXTURE0: u32 = 1;
+    const PREVIOUS_BUFFER: u32 = 5;
+    const CONSTANT: u32 = 6;
+    const PREVIOUS: u32 = 7;
+
+    /// one stage's input as the shader numbers it. The lighting colors are only
+    /// named when lighting is on, and a draw with lighting on never reaches the
+    /// OpenGL path; the shader answers them defensively all the same, the way
+    /// `apply` does when no fragment lighting ran (primary, and black for the
+    /// specular term that only lighting produces)
+    fn source(source: Source) -> u32 {
+        match source {
+            Source::PrimaryColor => Self::PRIMARY_COLOR,
+            Source::PrimaryFragmentColor => Self::PRIMARY_FRAGMENT,
+            Source::SecondaryFragmentColor => Self::SECONDARY_FRAGMENT,
+            Source::Texture(unit) => Self::TEXTURE0 + (unit.min(3) as u32),
+            Source::PreviousBuffer => Self::PREVIOUS_BUFFER,
+            Source::Constant => Self::CONSTANT,
+            Source::Previous => Self::PREVIOUS,
+        }
+    }
+
+    fn operation(operation: Operation) -> u32 {
+        match operation {
+            Operation::Replace => 0,
+            Operation::Modulate => 1,
+            Operation::Add => 2,
+            Operation::AddSigned => 3,
+            Operation::Lerp => 4,
+            Operation::Subtract => 5,
+            Operation::Dot3Rgb => 6,
+            Operation::Dot3Rgba => 7,
+            Operation::MultiplyAdd => 8,
+            Operation::AddMultiply => 9,
+        }
+    }
+}
+
+impl TexEnv {
+    /// the environment as the fragment shader's uniforms, ready to set stage by stage
+    pub(crate) fn opengl_uniforms(&self) -> TevUniforms {
+        let mut uniforms = TevUniforms::default();
+        for (index, stage) in self.stages.iter().enumerate() {
+            for (input, source) in stage.color_sources.iter().enumerate() {
+                uniforms.color_sources[index * 3 + input] = TevUniforms::source(*source);
+            }
+            for (input, source) in stage.alpha_sources.iter().enumerate() {
+                uniforms.alpha_sources[index * 3 + input] = TevUniforms::source(*source);
+            }
+            uniforms.color_operands[index * 3..index * 3 + 3]
+                .copy_from_slice(&stage.color_operands);
+            uniforms.alpha_operands[index * 3..index * 3 + 3]
+                .copy_from_slice(&stage.alpha_operands);
+            uniforms.color_ops[index] = TevUniforms::operation(stage.color_op);
+            uniforms.alpha_ops[index] = TevUniforms::operation(stage.alpha_op);
+            uniforms.constants[index] = stage.constant;
+            uniforms.color_scales[index] = stage.color_scale;
+            uniforms.alpha_scales[index] = stage.alpha_scale;
+            uniforms.passthrough[index] = self.passthrough[index] as u32;
+        }
+        for stage in 0..4 {
+            uniforms.update_mask |= (self.update_color[stage] as u32) << stage;
+            uniforms.update_mask |= (self.update_alpha[stage] as u32) << (stage + 4);
+        }
+        uniforms.buffer_color = self.buffer_color;
+        uniforms.all_passthrough = self.passthrough.iter().all(|&passthrough| passthrough);
+        uniforms
     }
 }
 
@@ -379,6 +503,7 @@ mod tests {
     #[test]
     fn a_modulate_stage_multiplies_its_inputs() {
         let env = TexEnv::read(&modulate_registers());
+        assert!(!env.is_vertex_color_passthrough());
         let out = env.apply([1.0, 0.5, 0.0, 1.0], [[0.5, 0.5, 0.5, 0.5]; 4], None);
         assert!((out[0] - 0.5).abs() < 1e-5, "red was {}", out[0]);
         assert!((out[1] - 0.25).abs() < 1e-5, "green was {}", out[1]);
@@ -396,6 +521,7 @@ mod tests {
             registers[base + 2] = 0x0000_0000; // replace
         }
         let env = TexEnv::read(&registers);
+        assert!(env.is_vertex_color_passthrough());
         let primary = [0.25, 0.5, 0.75, 1.0];
         let out = env.apply(primary, [[1.0, 0.0, 0.0, 1.0]; 4], None);
         for channel in 0..4 {
@@ -439,6 +565,7 @@ mod tests {
     #[test]
     fn pass_through_stages_leave_the_color_alone() {
         let env = TexEnv::read(&passthrough_registers());
+        assert!(env.is_vertex_color_passthrough());
         assert!(env.passthrough.iter().all(|&p| p));
         let color = [0.25, 0.5, 0.75, 1.0];
         assert_eq!(env.apply(color, [[0.0; 4]; 4], None), color);

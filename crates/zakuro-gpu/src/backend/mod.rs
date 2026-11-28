@@ -22,14 +22,20 @@ impl ScreenImage<'_> {
 }
 
 /// a screen's picture upright in one of the renderer's images, in the general layout,
-/// the Vulkan presenter draws straight from it when both share a device
+/// a presenter sharing the renderer's device draws straight from it
 #[derive(Debug, Clone, Copy)]
 pub struct GpuScreen {
     #[cfg(feature = "vulkan")]
     pub(crate) view: ash::vk::ImageView,
+    /// the OpenGL texture the picture is upright in, for a presenter sharing the context
+    #[cfg(feature = "opengl")]
+    pub(crate) gl_texture: Option<glow::Texture>,
     /// where the screen's pixels lie in the image as texture coords, the corner and the size,
-    /// then the corners inset by half a texel, filtering stays inside those
+    /// then the corners inset by half a texel, filtering stays inside those;
+    /// the OpenGL presenter draws the upright texture whole, its own size
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     pub(crate) area: [f32; 4],
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     pub(crate) bounds: [f32; 4],
 }
 

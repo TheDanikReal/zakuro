@@ -34,7 +34,7 @@ bytemuck = { version = "1", features = ["derive"] }
 parking_lot = "0.12"
 
 [profile.dev]
-opt-level = 1
+opt-level = "s"
 debug = true
 
 # a plain debug build is unusably slow, so the hot crates get O2 even in dev
@@ -51,6 +51,5 @@ opt-level = 3
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 4
+codegen-units = 1
 panic = "unwind"
-debug = 1

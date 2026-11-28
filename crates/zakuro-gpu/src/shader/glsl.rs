@@ -19,6 +19,12 @@ use super::{Op, Operand, Program, ShaderUnit, PROGRAM_SIZE};
 /// the semantics shade.vert's main reads, one per output component
 pub(crate) const SEMANTICS: usize = 24;
 
+/// the words the Shading block a translated program reads out of holds:
+/// the float uniforms, the integer ones, the bools and entry, the semantics,
+/// the depth map and viewport, then where each input register finds its attribute
+pub(crate) const SHADING_WORDS: usize = 96 * 4 + 4 * 4 + 4 + 24 + 4 + 4 + 16 * 4 + 16 * 4;
+
+
 /// executed instructions after which shade.vert gives up on a program
 /// the translation counts a run's at its start,
 /// and stops a run that crosses the limit b4 it writes an output shade.vert wouldn't have,
@@ -41,10 +47,17 @@ const STATES: usize = 1 << 16;
 
 impl ShaderUnit {
     /// the program from its entry point translated, like translate does
-    #[cfg(test)]
+    #[cfg(all(test, feature = "vulkan"))]
     pub(crate) fn translate(&self, semantics: &[u32; SEMANTICS]) -> Result<String, String> {
         let program = self.prepared().ok_or("the program was not prepared")?;
         translate(&program, self.entry_point, semantics)
+    }
+
+    /// the program translated for the OpenGL rasterizer's vertex stage, its
+    /// varyings named like the uber fragment shader reads them
+    pub(crate) fn translate_gl(&self, semantics: &[u32; SEMANTICS]) -> Result<String, String> {
+        let program = self.prepared().ok_or("the program was not prepared")?;
+        translate_gl(&program, self.entry_point, semantics)
     }
 
     /// the program as prepare decoded it, to translate it elsewhere
@@ -56,6 +69,7 @@ impl ShaderUnit {
 /// a program from an entry point as a GLSL vertex shader w/ shade.vert's interface,
 /// its outputs going where semantics says, the output register times four plus the component for each,
 /// or MISSING or ZERO like hardware.rs has them
+#[cfg(feature = "vulkan")]
 pub(crate) fn translate(program: &Program, entry_point: u32, semantics: &[u32; SEMANTICS]) -> Result<String, String> {
     let translator = Translator::new(program, entry_point)?;
     let length: usize = translator.runs.values().map(|run| run.length() as usize).sum();
@@ -65,8 +79,22 @@ pub(crate) fn translate(program: &Program, entry_point: u32, semantics: &[u32; S
     Ok(translator.shader(semantics))
 }
 
+/// the same program as a vertex shader for the OpenGL rasterizer: the same GLSL
+/// under run(), reading its inputs out of the same storage block layout, with
+/// the outputs named like the uber fragment shader reads them and the position
+/// placed like the software rasterizer's to_screen places it
+pub(crate) fn translate_gl(program: &Program, entry_point: u32, semantics: &[u32; SEMANTICS]) -> Result<String, String> {
+    let translator = Translator::new(program, entry_point)?;
+    let length: usize = translator.runs.values().map(|run| run.length() as usize).sum();
+    if length > LONGEST {
+        return Err(format!("{length} reachable instructions, more than {LONGEST}"));
+    }
+    Ok(translator.shader_gl(semantics))
+}
+
 /// a vertex shader in GLSL to SPIR-V for vkCreateShaderModule, or why not
 /// naga can panic on some inputs, so a panic is an error too, and the caller keeps the interpreter to fall back on
+#[cfg(feature = "vulkan")]
 pub(crate) fn compile(source: &str) -> Result<Vec<u32>, String> {
     use naga::back::spv;
     use naga::front::glsl;
@@ -151,17 +179,17 @@ impl<'a> Translator<'a> {
         self.runs.values().any(|run| matches!(run.exit, Exit::Flow(_)))
     }
 
-    fn shader(mut self, semantics: &[u32; SEMANTICS]) -> String {
+    /// the program's run(), its instructions and the block stack when it has
+    /// flow, both flavors of the shader assembling around what this returns
+    fn run(mut self) -> (String, bool) {
         let flows = self.flows();
-        let mut run = String::new();
+        let mut body = String::new();
         if flows {
-            self.dispatch(&mut run);
+            self.dispatch(&mut body);
         } else {
-            self.straight(&mut run);
+            self.straight(&mut body);
         }
-
-        let mut out = String::with_capacity(run.len() + 8192);
-        out.push_str(HEADER);
+        let mut out = String::new();
         if flows {
             out.push_str(BLOCKS);
         }
@@ -170,9 +198,18 @@ impl<'a> Translator<'a> {
         for register in (0..16).filter(|register| self.read & (1 << register) != 0) {
             let _ = writeln!(out, "    vec4 v{register} = input_register({register}u);");
         }
-        out.push_str(&run);
+        out.push_str(&body);
         out.push_str("}\n\n");
+        (out, flows)
+    }
 
+    /// the shade.vert flavor: its outputs and its depth mapped by the depth map
+    #[cfg(feature = "vulkan")]
+    fn shader(self, semantics: &[u32; SEMANTICS]) -> String {
+        let (run, flows) = self.run();
+        let mut out = String::with_capacity(run.len() + 8192);
+        out.push_str(&header());
+        out.push_str(&run);
         out.push_str("void main() {\n");
         out.push_str("    for (int i = 0; i < 16; i++) {\n");
         out.push_str("        temps[i] = vec4(0.0, 0.0, 0.0, 1.0);\n");
@@ -196,6 +233,46 @@ impl<'a> Translator<'a> {
         out.push_str("    out_depth = position.z / position.w * depth_map.x + depth_map.y;\n");
         let _ = writeln!(out, "    out_quaternion = vec4({});", vector(14..18, "0.0"));
         let _ = writeln!(out, "    out_view = vec4({}, {});", vector(18..21, "0.0"), component(21, "1.0"));
+        out.push_str("}\n");
+        out
+    }
+
+    /// the OpenGL rasterizer's flavor: the varyings its uber fragment shader
+    /// reads, the depth left raw for the fragment's own scale and offset, and
+    /// the position placed like to_screen places it, an upside down buffer's
+    /// rows flipped here, z kept in the PICA's -w..0 and handed to the clip
+    /// distance so GL clips the volume the PICA does
+    fn shader_gl(self, semantics: &[u32; SEMANTICS]) -> String {
+        let (run, flows) = self.run();
+        let mut out = String::with_capacity(run.len() + 8192);
+        out.push_str(&header_gl());
+        out.push_str(&run);
+        out.push_str("void main() {\n");
+        out.push_str("    for (int i = 0; i < 16; i++) {\n");
+        out.push_str("        temps[i] = vec4(0.0, 0.0, 0.0, 1.0);\n");
+        out.push_str("        outputs[i] = vec4(0.0);\n");
+        out.push_str("    }\n");
+        out.push_str("    address = ivec3(0);\n");
+        out.push_str("    condition = bvec2(false);\n");
+        if flows {
+            out.push_str("    blocks = 0;\n");
+        }
+        out.push_str("    run();\n");
+        let component = |which: usize, missing: &str| semantic(semantics[which], missing);
+        let vector = |range: std::ops::Range<usize>, missing: &str| {
+            range.map(|which| component(which, missing)).collect::<Vec<_>>().join(", ")
+        };
+        let _ = writeln!(out, "    vec4 position = vec4({});", vector(0..4, "0.0"));
+        out.push_str(EPILOGUE_GL);
+        let _ = writeln!(out, "    vertex_color = vec4({});", vector(4..8, "1.0"));
+        let _ = writeln!(out, "    uv0 = vec2({}, {});", component(8, "0.0"), component(9, "0.0"));
+        let _ = writeln!(out, "    uv1 = vec2({}, {});", component(10, "0.0"), component(11, "0.0"));
+        let _ = writeln!(out, "    uv2 = vec2({}, {});", component(12, "0.0"), component(13, "0.0"));
+        let _ = writeln!(out, "    pica_depth = position.z / position.w;");
+        let _ = writeln!(out, "    pica_inverse_w = 1.0 / position.w;");
+        let _ = writeln!(out, "    q0 = {};", component(21, "1.0"));
+        let _ = writeln!(out, "    quaternion = vec4({});", vector(14..18, "0.0"));
+        let _ = writeln!(out, "    view = vec3({});", vector(18..21, "0.0"));
         out.push_str("}\n");
         out
     }
@@ -664,17 +741,32 @@ fn semantic(slot: u32, missing: &str) -> String {
     }
 }
 
-/// shade.vert's interface and the helpers its math uses, the same layouts so stage_shading fills it the same way, and no program buffer
-const HEADER: &str = r#"#version 450
-
-layout(location = 0) out vec4 out_color;
+/// the outputs shade.vert's main writes, one semantic slot a varying
+#[cfg(feature = "vulkan")]
+const OUT: &str = r#"layout(location = 0) out vec4 out_color;
 layout(location = 1) out vec4 out_texcoords01;
 layout(location = 2) out vec2 out_texcoord2;
 layout(location = 3) noperspective out float out_depth;
 layout(location = 4) out vec4 out_quaternion;
 layout(location = 5) out vec4 out_view;
+"#;
 
-layout(std430, set = 0, binding = 6) readonly buffer Shading {
+/// the outputs the OpenGL uber fragment stage reads, by the names it reads them
+const OUT_GL: &str = r#"layout(location = 0) out vec4 vertex_color;
+layout(location = 1) noperspective out float pica_depth;
+layout(location = 2) noperspective out float pica_inverse_w;
+layout(location = 3) out vec2 uv0;
+layout(location = 4) out vec2 uv1;
+layout(location = 5) out vec2 uv2;
+layout(location = 6) out float q0;
+layout(location = 7) out vec4 quaternion;
+layout(location = 8) out vec3 view;
+"#;
+
+/// what the vertex stage reads besides its program, the same layouts so the
+/// shading stage fills it the same way, and no program buffer. Vulkan names its
+/// descriptor bindings thru a set, GL names them flat
+const SHADING_BLOCK: &str = r#"layout(std430, {SET}binding = 6) readonly buffer Shading {
     vec4 floats[96];
     ivec4 integers[4];
     uint bools;
@@ -687,11 +779,15 @@ layout(std430, set = 0, binding = 6) readonly buffer Shading {
     vec4 defaults[16];
 };
 
-layout(std430, set = 0, binding = 7) readonly buffer Inputs {
+layout(std430, {SET}binding = 7) readonly buffer Inputs {
     uint vertex_bytes[];
 };
+"#;
 
-vec4 temps[16];
+/// the interpreter state and the helpers its math uses, the same layouts so the
+/// shading stage fills them the same way; the vertex index is Vulkan's
+/// gl_VertexIndex or GL's gl_VertexID
+const HELPERS: &str = r#"vec4 temps[16];
 vec4 outputs[16];
 ivec3 address;
 bvec2 condition;
@@ -758,7 +854,7 @@ vec4 input_register(uint r) {
     }
     uint type = (field.z >> 8u) & 0xFFu;
     uint size = type == 3u ? 4u : (type == 2u ? 2u : 1u);
-    uint at = field.x + uint(gl_VertexIndex) * field.y + (field.z & 0xFFu);
+    uint at = field.x + uint({VERTEX_INDEX}) * field.y + (field.z & 0xFFu);
     value.x = component(at, type);
     if (count > 1u) {
         value.y = component(at + size, type);
@@ -773,6 +869,28 @@ vec4 input_register(uint r) {
 }
 
 "#;
+
+/// shade.vert's interface and the helpers its math uses
+#[cfg(feature = "vulkan")]
+fn header() -> String {
+    format!(
+        "#version 450\n\n{}{}",
+        SHADING_BLOCK.replace("{SET}", "set = 0, "),
+        HELPERS.replace("{VERTEX_INDEX}", "gl_VertexIndex"),
+    )
+}
+
+/// the OpenGL rasterizer's interface and the helpers its math uses, plus the
+/// uniforms that say where the PICA's viewport sits on the target and whether
+/// its rows run from the top
+fn header_gl() -> String {
+    format!(
+        "#version 430\n\n{}\nuniform vec2 buffer_size;\nuniform int flip;\n\n{}{}",
+        OUT_GL,
+        SHADING_BLOCK.replace("{SET}", ""),
+        HELPERS.replace("{VERTEX_INDEX}", "gl_VertexID"),
+    )
+}
 
 /// shade.vert's block stack and enter, for programs w/ flow
 const BLOCKS: &str = r#"uint block_end[16];
@@ -818,6 +936,7 @@ const BLOCK_ENDS: &str = r#"        while (blocks > 0) {
 
 /// shade.vert's main from the position on, the PICA placing vertices on a 16th of a pixel,
 /// halves to even as both round them, and clipping z to -w..0, which Vulkan has as 0..w
+#[cfg(feature = "vulkan")]
 const EPILOGUE: &str = r#"    if (position.w > 1e-5) {
         vec2 window = viewport.xy + (position.xy / position.w * 0.5 + 0.5) * viewport.zw;
         window = roundEven(window * 16.0) / 16.0;
@@ -833,6 +952,33 @@ const EPILOGUE: &str = r#"    if (position.w > 1e-5) {
         position.z = -position.w;
     }
     gl_Position = vec4(position.xy, -position.z, position.w);
+"#;
+
+/// the OpenGL flavor's main from the position on: the same 16th-of-a-pixel
+/// placement and the same z nudges, the buffer's rows flipped when it runs from
+/// its top, GL clipping the PICA's -w..0 thru the clip distance, and the
+/// already placed NDC taking the whole target as its viewport
+const EPILOGUE_GL: &str = r#"    // z on an end of the range the PICA draws when it misses one only by
+    // rounding, as clip_triangle has it
+    float z_over_w = position.z / position.w;
+    if (z_over_w > 0.0 && z_over_w < 1e-8) {
+        position.z = 0.0;
+    } else if (z_over_w < -1.0 && z_over_w > -1.00001) {
+        position.z = -position.w;
+    }
+    if (position.w > 1e-5) {
+        vec2 window = viewport.xy + (position.xy / position.w * 0.5 + 0.5) * viewport.zw;
+        window = roundEven(window * 16.0) / 16.0;
+        if (flip == 1) {
+            window.y = buffer_size.y - window.y;
+        }
+        gl_Position = vec4((window / buffer_size * 2.0 - 1.0) * position.w, position.z, position.w);
+    } else {
+        gl_Position = vec4(position.xy, position.z, position.w);
+    }
+    // the PICA draws -w <= z <= 0, GL's own clip keeps z past -w, this keeps it
+    // under 0, so between them the volume is the PICA's
+    gl_ClipDistance[0] = -position.z;
 "#;
 
 #[cfg(test)]
@@ -926,6 +1072,7 @@ mod tests {
     }
 
     /// translates and compiles, failing w/ the source on any error, and checks the SPIR-V w/ `spirv-val` when it's installed
+    #[cfg(feature = "vulkan")]
     fn compiles(unit: &ShaderUnit, semantics: &[u32; SEMANTICS]) -> String {
         let glsl = unit.translate(semantics).unwrap();
         let words = compile(&glsl).unwrap_or_else(|error| panic!("{error}\n{glsl}"));
@@ -938,6 +1085,13 @@ mod tests {
         }
         let _ = std::fs::remove_file(path);
         glsl
+    }
+
+    /// without Vulkan's compiler the tests settle for the OpenGL flavor
+    /// translating, whose GL the differential tests compile for real
+    #[cfg(not(feature = "vulkan"))]
+    fn compiles(unit: &ShaderUnit, semantics: &[u32; SEMANTICS]) -> String {
+        unit.translate_gl(semantics).expect("the program translated")
     }
 
     /// programs of nothing but arithmetic come out straight, w/ no dispatch, and compile
@@ -971,7 +1125,17 @@ mod tests {
             let unit = unit(&program, entry, &mut random);
             // falling into the words after the program leaves it to the interpreter
             let semantics = semantics(&mut random);
-            if unit.translate(&semantics).is_ok() {
+            let translated = {
+                #[cfg(feature = "vulkan")]
+                {
+                    unit.translate(&semantics).is_ok()
+                }
+                #[cfg(not(feature = "vulkan"))]
+                {
+                    unit.translate_gl(&semantics).is_ok()
+                }
+            };
+            if translated {
                 compiles(&unit, &semantics);
                 compiled += 1;
             }
@@ -986,7 +1150,11 @@ mod tests {
         // a jump past the end into words of zero, each an add
         let program = [(0x2C << 26) | (1 << 22) | (8 << 10), 0x22 << 26];
         let unit = unit(&program, 0, &mut random);
-        assert!(unit.translate(&semantics(&mut random)).is_err());
+        #[cfg(feature = "vulkan")]
+        let refused = unit.translate(&semantics(&mut random)).is_err();
+        #[cfg(not(feature = "vulkan"))]
+        let refused = unit.translate_gl(&semantics(&mut random)).is_err();
+        assert!(refused);
     }
 
     /// a program running into the last word and past it, inside a call whose end is just past the program,

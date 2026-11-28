@@ -66,9 +66,11 @@ impl Table {
 
 /// a draw's fog, when its mode mixes it in
 pub struct Fog<'a> {
-    color: [f32; 3],
-    flip: bool,
-    table: &'a Table,
+    /// the fog's color, bytes from red up
+    pub(crate) color: [f32; 3],
+    /// does the depth go into the table from the far end
+    pub(crate) flip: bool,
+    pub(crate) table: &'a Table,
 }
 
 impl<'a> Fog<'a> {

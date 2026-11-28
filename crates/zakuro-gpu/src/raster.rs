@@ -10,6 +10,13 @@ use crate::lighting::{Lighting, Tables};
 
 #[cfg(feature = "vulkan")]
 pub(crate) mod hardware;
+#[cfg(feature = "opengl")]
+pub(crate) mod opengl;
+
+/// the OpenGL rasterizer's differential tests against the CPU one
+#[cfg(all(test, feature = "opengl"))]
+#[path = "raster/opengl_differential.rs"]
+mod opengl_differential;
 use crate::texture::TextureFormat;
 use crate::shader::{self, ShaderUnit, Vec4};
 use crate::{format::ColorFormat, GpuMemory};
@@ -827,6 +834,71 @@ fn shading_ahead() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ZAKURO_SHADE_AHEAD").map_or(true, |value| value != "0"))
 }
 
+/// the vertices a draw names, from the first to the last, once its indices are in scratch
+fn draw_vertex_range(registers: &[u32], scratch: &Scratch, indexed: bool) -> (u32, u32) {
+    let short = registers[REG_INDEX_ARRAY] & 0x8000_0000 != 0;
+    match (indexed, short) {
+        (false, _) => {
+            let first = registers[REG_VERTEX_OFFSET];
+            (first, first + registers[REG_VERTEX_COUNT] - 1)
+        }
+        (true, true) => {
+            let halves = scratch.bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as u32);
+            halves.fold((u32::MAX, 0), |(low, high), index| (low.min(index), high.max(index)))
+        }
+        (true, false) => scratch.bytes.iter().fold((u32::MAX, 0), |(low, high), &index| {
+            (low.min(index as u32), high.max(index as u32))
+        }),
+    }
+}
+
+/// the index buffer's own bytes, which the CPU happens to read from guest memory
+/// even while an OpenGL surface holds newer bytes over the same address
+#[cfg(feature = "opengl")]
+fn sync_index_input<M: GpuMemory>(
+    renderer: Option<&mut opengl::OpenGlRasterizer>,
+    memory: &mut M,
+    registers: &[u32],
+) {
+    let Some(renderer) = renderer else {
+        return;
+    };
+    let config = registers[REG_INDEX_ARRAY];
+    let size = if config & 0x8000_0000 != 0 { 2 } else { 1 };
+    let len = registers[REG_VERTEX_COUNT].saturating_mul(size);
+    if len != 0 {
+        let addr = memory.translate(
+            loc_register(registers, REG_ATTRIBUTE_BASE).saturating_add(config & 0x0FFF_FFFF),
+        );
+        renderer.sync(memory, addr, len, false);
+    }
+}
+
+/// each attribute array's bytes from the first vertex the draw names to the last,
+/// whose ranges a dirty OpenGL surface under them resolves into guest memory
+/// first, like the texture units' ranges do before a decode reads their bytes
+#[cfg(feature = "opengl")]
+fn sync_vertex_input<M: GpuMemory>(
+    renderer: Option<&mut opengl::OpenGlRasterizer>,
+    memory: &mut M,
+    registers: &[u32],
+    plan: &InputPlan,
+    (low, high): (u32, u32),
+) {
+    let Some(renderer) = renderer else {
+        return;
+    };
+    let base = loc_register(registers, REG_ATTRIBUTE_BASE);
+    for loader in &plan.loaders {
+        let first = base + loader.offset + low * loader.stride;
+        let last = base + loader.offset + high * loader.stride;
+        let len = last - first + loader.size;
+        if len != 0 {
+            renderer.sync(memory, memory.translate(first), len, false);
+        }
+    }
+}
+
 /// the walk ahead's half of a command list's draw
 /// what draw reads of memory first (the index buffer and the vertices it names) handed w/ the state shading takes
 /// to another thread, which shades, clips and places them for the real walk's draw
@@ -846,21 +918,17 @@ pub(crate) fn hand_out<M: GpuMemory>(
     }
     let writes = memory.writes();
     let scratch = resources.scratch.get_or_insert_with(Box::default);
+    // a dirty OpenGL surface under the draw's vertex bytes resolves into guest
+    // memory first, like the texture units' ranges do before a decode
+    #[cfg(feature = "opengl")]
+    sync_index_input(resources.opengl.as_mut(), memory, registers);
     read_indices(registers, memory, scratch, indexed);
-    let plan = scratch.plans.update(registers, fixed_attributes);
     // the vertices the draw names, from the first to the last
     let short = registers[REG_INDEX_ARRAY] & 0x8000_0000 != 0;
-    let range = match (indexed, short) {
-        (false, _) => {
-            let first = registers[REG_VERTEX_OFFSET];
-            (first, first + vertex_count - 1)
-        }
-        (true, true) => {
-            let halves = scratch.bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as u32);
-            halves.fold((u32::MAX, 0), |(low, high), index| (low.min(index), high.max(index)))
-        }
-        (true, false) => scratch.bytes.iter().fold((u32::MAX, 0), |(low, high), &index| (low.min(index as u32), high.max(index as u32))),
-    };
+    let range = draw_vertex_range(registers, scratch, indexed);
+    let plan = scratch.plans.update(registers, fixed_attributes);
+    #[cfg(feature = "opengl")]
+    sync_vertex_input(resources.opengl.as_mut(), memory, registers, plan, range);
     // the bytes the thread decodes the vertices from, or the vertices decoded here where the arrays don't sit together in memory
     let attribute_base = loc_register(registers, REG_ATTRIBUTE_BASE);
     let fetched = match plan.copy(memory, attribute_base, range, vertex_count) {
@@ -1065,10 +1133,15 @@ fn buffer_size(registers: &[u32], (x, y, width, height): (f32, f32, f32, f32)) -
     ((dimensions & 0x7FF).max(right.max(1) as u32), (((dimensions >> 12) & 0x3FF) + 1).max(top.max(1) as u32))
 }
 
+/// a semantic no output register carries, which takes its default
+pub(crate) const MISSING: u32 = u32::MAX;
+/// a semantic in an output attribute past the enabled registers, zero
+pub(crate) const ZERO: u32 = u32::MAX - 1;
+
 /// where the GPU's vertex shader finds each varying, per semantic component of position, color, texture coords 0,
 /// 1 and 2, the quaternion, the view vector and coord set 0's w
 /// the output register times four plus the component, like to_vertex reads them
-#[cfg(feature = "vulkan")]
+#[cfg(any(feature = "vulkan", feature = "opengl"))]
 fn output_semantics(registers: &[u32]) -> [u32; 24] {
     let map = read_output_map(registers);
     let mask = registers[REG_VS_OUTPUT_MASK] & 0xFFFF;
@@ -1081,9 +1154,9 @@ fn output_semantics(registers: &[u32]) -> [u32; 24] {
     }
     let enabled = &enabled[..count];
     let slot = |slot: Option<(usize, usize)>| match slot {
-        None => hardware::MISSING,
+        None => MISSING,
         Some((attribute, component)) => {
-            enabled.get(attribute).map_or(hardware::ZERO, |&register| (register * 4 + component) as u32)
+            enabled.get(attribute).map_or(ZERO, |&register| (register * 4 + component) as u32)
         }
     };
     let [t0, t1, t2] = map.texcoords;
@@ -1098,7 +1171,7 @@ fn output_semantics(registers: &[u32]) -> [u32; 24] {
         .chain(map.quaternion)
         .chain(map.view)
         .chain([map.texcoord0_w]);
-    let mut semantics = [hardware::MISSING; 24];
+    let mut semantics = [MISSING; 24];
     for (semantic, found) in semantics.iter_mut().zip(slots) {
         *semantic = slot(found);
     }
@@ -1122,14 +1195,14 @@ pub(crate) fn placing_outputs(registers: &[u32]) -> (u16, u16) {
 
 /// the semantics output_semantics worked out for the last draw,
 /// and the registers they came from (the output map and mask), draws mostly keep those
-#[cfg(feature = "vulkan")]
+#[cfg(any(feature = "vulkan", feature = "opengl"))]
 #[derive(Default)]
 struct LastSemantics {
     read: [u32; 9],
     semantics: Option<[u32; 24]>,
 }
 
-#[cfg(feature = "vulkan")]
+#[cfg(any(feature = "vulkan", feature = "opengl"))]
 impl LastSemantics {
     fn get(&mut self, registers: &[u32]) -> [u32; 24] {
         let mut read = [0; 9];
@@ -1457,11 +1530,13 @@ pub struct Resources {
     tex_env: crate::tev::LastTexEnv,
     lighting: crate::lighting::LastLighting,
     /// where the last draw's varyings were in the output registers
-    #[cfg(feature = "vulkan")]
+    #[cfg(any(feature = "vulkan", feature = "opengl"))]
     semantics: LastSemantics,
     /// the host GPU, when draws go to it instead of the software path
     #[cfg(feature = "vulkan")]
     pub(crate) hardware: Option<hardware::Hardware>,
+    #[cfg(feature = "opengl")]
+    pub(crate) opengl: Option<opengl::OpenGlRasterizer>,
 }
 
 impl Resources {
@@ -1485,6 +1560,10 @@ impl Resources {
             if let Some(hardware) = self.hardware.as_mut() {
                 hardware.forget();
             }
+        }
+        #[cfg(feature = "opengl")]
+        if let Some(renderer) = self.opengl.as_mut() {
+            renderer.reset();
         }
     }
 
@@ -1986,7 +2065,7 @@ fn drawn_texture<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Op
 }
 
 /// the guest memory a texture unit reads, when it's on
-#[cfg(feature = "vulkan")]
+#[cfg(any(feature = "vulkan", feature = "opengl"))]
 fn texture_range<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Option<(u32, u32)> {
     if registers[REG_TEXTURE_CONFIG] & (1 << unit) == 0 {
         return None;
@@ -2000,8 +2079,58 @@ fn texture_range<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Op
     if width == 0 || height == 0 || address == 0 {
         return None;
     }
-    let size = texture_bytes(format, width, height, level_count(registers, base, width, height));
+    let size = texture_bytes(
+        format,
+        width,
+        height,
+        level_count(registers, base, width, height),
+    );
     Some((memory.translate(address), size as u32))
+}
+
+/// a draw's texture units and combiners as the OpenGL uber-shader takes them,
+/// or None when a bound unit carries state the shader cannot run yet
+#[cfg(feature = "opengl")]
+fn gl_texture_setup(state: &DrawState) -> Option<opengl::TextureSetup> {
+    let units = std::array::from_fn(|unit| {
+        state.textures[unit]
+            .as_ref()
+            .map(|texture| opengl::TextureUnit {
+                texels: texture.texels.clone(),
+                width: texture.width,
+                height: texture.height,
+                levels: texture.levels,
+                mag_linear: texture.linear,
+                min_linear: texture.lod.linear,
+                wrap_s: gl_wrap(texture.wrap_s),
+                wrap_t: gl_wrap(texture.wrap_t),
+                border: texture.border,
+                lod: [
+                    f32::from(texture.lod.bias) / 256.0,
+                    f32::from(texture.lod.min),
+                    f32::from(texture.lod.max),
+                    texture.lod.between as u32 as f32,
+                ],
+            })
+    });
+    Some(opengl::TextureSetup {
+        units,
+        texture0_projected: state.texture0_projected,
+        texture2_uses_coord1: state.texture2_uses_coord1,
+        tev: state.tex_env.opengl_uniforms(),
+    })
+}
+
+/// the wrap modes onto the shader's numbers, which happen to be the order the
+/// Wrap enum lists them in: clamp to edge, clamp to border, repeat, mirrored
+#[cfg(feature = "opengl")]
+fn gl_wrap(wrap: Wrap) -> u32 {
+    match wrap {
+        Wrap::ClampToEdge => 0,
+        Wrap::ClampToBorder => 1,
+        Wrap::Repeat => 2,
+        Wrap::MirroredRepeat => 3,
+    }
 }
 
 /// where and how depth testing reads/writes, or None when off
@@ -2717,6 +2846,36 @@ impl Edge {
     }
 }
 
+/// the target and state the OpenGL rasterizer takes a draw under, past what the
+/// texture setup and the output merger already answered for
+#[cfg(feature = "opengl")]
+fn gl_target_supported(state: &DrawState) -> bool {
+    state.target.buffer_width.is_multiple_of(8)
+        && state.target.buffer_height.is_multiple_of(8)
+        && matches!(
+            state.target.format,
+            ColorFormat::Rgba8 | ColorFormat::Rgb8 | ColorFormat::Rgb565 | ColorFormat::Rgb5A1 | ColorFormat::Rgba4
+        )
+        && state.proctex.is_none()
+        && state.depth_stencil.as_ref().map_or(true, |depth| {
+            let color_end = state.target.addr.saturating_add(
+                state
+                    .target
+                    .buffer_width
+                    .saturating_mul(state.target.buffer_height)
+                    .saturating_mul(state.target.format.bytes_per_pixel() as u32),
+            );
+            let depth_end = depth.addr.saturating_add(
+                state
+                    .target
+                    .buffer_width
+                    .saturating_mul(state.target.buffer_height)
+                    .saturating_mul(depth.bytes),
+            );
+            color_end <= depth.addr || depth_end <= state.target.addr
+        })
+}
+
 /// runs a draw call, fetches vertices, shades them, assembles triangles and fills them, returns the number of vertices processed
 pub fn draw<M: GpuMemory>(
     registers: &[u32],
@@ -2750,7 +2909,13 @@ pub fn draw<M: GpuMemory>(
 
     // an index buffer names most vertices several times, fetch and shade each of them once
     let mut scratch = resources.scratch.take().unwrap_or_default();
+    // a dirty OpenGL surface under the draw's vertex bytes resolves into guest
+    // memory first, like the texture units' ranges do before a decode
+    #[cfg(feature = "opengl")]
+    sync_index_input(resources.opengl.as_mut(), memory, registers);
     read_indices(registers, memory, &mut scratch, indexed);
+    #[cfg(feature = "opengl")]
+    let vertex_range = draw_vertex_range(registers, &scratch, indexed);
     let plan = scratch.plans.update(registers, fixed_attributes);
     log::trace!(
         "array draw: {vertex_count} vertices from 0x{attribute_base:08X}, indexed {indexed}, formats \
@@ -2758,6 +2923,14 @@ pub fn draw<M: GpuMemory>(
         registers[REG_ATTRIBUTE_FORMAT_HIGH],
         registers[REG_ATTRIBUTE_FORMAT_LOW],
         plan.loaders.iter().map(|l| (l.offset, l.stride, l.size)).collect::<Vec<_>>(),
+    );
+    #[cfg(feature = "opengl")]
+    sync_vertex_input(
+        resources.opengl.as_mut(),
+        memory,
+        registers,
+        plan,
+        vertex_range,
     );
     // the GPU decodes the arrays itself when it shades the draw, from the first vertex the draw uses to the last
     #[cfg(feature = "vulkan")]
@@ -2968,7 +3141,7 @@ fn primitives<'a>(
 }
 
 /// the vertices of each triangle out of count of them, for a list, a strip (1) or a fan (2)
-fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
+pub(crate) fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
     match topology {
         1 => (2..count).map(|i| if i % 2 == 0 { (i - 2, i - 1, i) } else { (i - 1, i - 2, i) }).collect(),
         2 => (2..count).map(|i| (0, i - 1, i)).collect(),
@@ -3038,6 +3211,14 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 if let Err(error) = hardware.prepare_read(memory, addr, len) {
                     log::error!("the GPU could not write back a buffer, {error}");
                 }
+            }
+        }
+    }
+    #[cfg(feature = "opengl")]
+    if let Some(renderer) = resources.opengl.as_mut() {
+        for unit in 0..3 {
+            if let Some((addr, len)) = texture_range(registers, memory, unit) {
+                renderer.sync(memory, addr, len, false);
             }
         }
     }
@@ -3120,6 +3301,60 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         }
     }
     let (processed, placed_here);
+    // the OpenGL rasterizer runs the vertex shader itself on draws that have one
+    // and no geometry shader after it, GL clipping and culling like the PICA does
+    // with the volume and winding the translated shader hands it; a geometry
+    // shader's draws go thru the CPU's preparation instead
+    #[cfg(feature = "opengl")]
+    if resources.opengl.is_some() {
+        if let Vertices::Unshaded { vertex_shader, inputs, order, .. } = vertices {
+            if registers[REG_GEOSTAGE_CONFIG] & 0x3 != 2 {
+                // the output merger the GL path mirrors w/ its fixed function, the
+                // texture units and combiners as the uber-shader takes them, and the
+                // fragment stages past the units: none of it changes w/ the vertices
+                let output = opengl::output_state(
+                    state.blend.as_ref(),
+                    state.logic_op,
+                    state.alpha_test.as_ref().map(|test| (test.function, test.reference)),
+                    state.target.write,
+                );
+                let texture_setup = gl_texture_setup(&state).filter(|_| gl_target_supported(&state));
+                if let (Some(output), Some(texture_setup)) = (output, texture_setup) {
+                    let semantics = resources.semantics.get(registers);
+                    let shaded = opengl::ShadedDraw {
+                        unit: vertex_shader,
+                        inputs,
+                        order,
+                        semantics,
+                        viewport,
+                        cull: registers[REG_FACE_CULLING] & 0x3,
+                        flip: upside_down(registers),
+                        topology: (registers[REG_PRIMITIVE_CONFIG] >> 8) & 0x3,
+                    };
+                    let fragment = opengl::FragmentSetup {
+                        lighting: state.lighting,
+                        tables: state.tables,
+                        fog: state.fog.as_ref(),
+                    };
+                    match resources.opengl.as_mut().unwrap().draw_shaded(
+                        memory,
+                        &state.target,
+                        state.depth_stencil.as_ref(),
+                        state.depth_map,
+                        &output,
+                        &texture_setup,
+                        &fragment,
+                        &shaded,
+                    ) {
+                        Ok(triangles) => return Some(triangles),
+                        Err(error) => log::error!(
+                            "the OpenGL rasterizer could not shade the vertices, {error}, shading on the CPU"
+                        ),
+                    }
+                }
+            }
+        }
+    }
     // the order goes to the software path, only the GPU falls back on it
     #[cfg_attr(not(feature = "vulkan"), allow(unused_variables))]
     let (shaded, order, placement) = match vertices {
@@ -3174,6 +3409,60 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
 
     let triangles: Vec<[Screen; 3]> =
         indices.as_chunks::<3>().0.iter().map(|&[a, b, c]| [placed[a as usize], placed[b as usize], placed[c as usize]]).collect();
+    #[cfg(feature = "opengl")]
+    if let Some(renderer) = resources.opengl.as_mut() {
+        // the output merger, what the GL path mirrors w/ its fixed function, or
+        // None for state it cannot take, like a logic op or a blend factor GL lacks
+        let output = opengl::output_state(
+            state.blend.as_ref(),
+            state.logic_op,
+            state
+                .alpha_test
+                .as_ref()
+                .map(|test| (test.function, test.reference)),
+            state.target.write,
+        );
+        if let Some(output) = output {
+            // the texture units as the uber-shader takes them, and the combiners
+            let texture_setup = gl_texture_setup(&state);
+            // the fragment stages the uber-shader runs past the units: fragment
+            // lighting with all its lights, tables and bump and shadow reads,
+            // and the fog. Procedural textures stay on the CPU.
+            let fragment = opengl::FragmentSetup {
+                lighting: state.lighting,
+                tables: state.tables,
+                fog: state.fog.as_ref(),
+            };
+            let supported = texture_setup.is_some() && gl_target_supported(&state);
+            if supported {
+                let texture_setup = texture_setup.expect("supported means the units are taken");
+                match renderer.draw(
+                    memory,
+                    &state.target,
+                    state.depth_stencil.as_ref(),
+                    state.depth_map,
+                    &output,
+                    &texture_setup,
+                    &fragment,
+                    &triangles,
+                ) {
+                    Ok(()) => return Some(triangle_count as u32),
+                    Err(error) => log::error!(
+                        "the OpenGL rasterizer could not draw, {error}, drawing in software"
+                    ),
+                }
+            }
+        }
+    }
+    #[cfg(feature = "opengl")]
+    if let Some(renderer) = resources.opengl.as_mut() {
+        let target = &state.target;
+        let color_len = target.buffer_width.saturating_mul(target.buffer_height).saturating_mul(target.format.bytes_per_pixel() as u32);
+        renderer.sync(memory, target.addr, color_len, true);
+        if let Some(depth) = &state.depth_stencil {
+            renderer.sync(memory, depth.addr, target.buffer_width.saturating_mul(target.buffer_height).saturating_mul(depth.bytes), true);
+        }
+    }
     // the rows the triangles can reach, as window rows then as rows of the buffer, which counts from the other end
     let target = &state.target;
     let low = triangles.iter().map(|t| t.iter().map(|v| v.y).fold(f32::MAX, f32::min).floor() as i32).min();
@@ -3331,7 +3620,7 @@ mod tests {
     /// guest memory seen like the GPU sees it, physical VRAM and FCRAM translate to different virtual windows
     /// its first MBs lie in one piece like the linear heap and VRAM do, unless it's scattered
     #[derive(Clone)]
-    struct ConsoleMemory {
+    pub(crate) struct ConsoleMemory {
         flat: Vec<u8>,
         rest: HashMap<u32, u8>,
         /// does slice hand out the flat bytes
@@ -3449,7 +3738,7 @@ mod tests {
     const DEPTH: u32 = 0x3000;
 
     /// the inverse of decode_float24, for normal values
-    fn float24(value: f32) -> u32 {
+    pub(crate) fn float24(value: f32) -> u32 {
         if value == 0.0 {
             return 0;
         }
@@ -3459,8 +3748,23 @@ mod tests {
     }
 
     /// an 8x8 RGBA8 target w/ color writes on and a D24S8 buffer beside it
-    fn rasterize_shaded<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, shaded: &[Vertex]) -> u32 {
+    pub(crate) fn rasterize_shaded<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, shaded: &[Vertex]) -> u32 {
         rasterize(registers, memory, resources, Vertices::Shaded(shaded)).unwrap_or(0)
+    }
+
+    /// a draw whose vertices still run the shader: the OpenGL path shades them
+    /// on the GPU when it can, the CPU otherwise, and one with a geometry
+    /// shader after the vertex shader always prepares on the CPU
+    pub(crate) fn rasterize_unshaded<M: GpuMemory>(
+        registers: &[u32],
+        memory: &mut M,
+        resources: &mut Resources,
+        vertex_shader: &ShaderUnit,
+        geometry_shader: &ShaderUnit,
+        inputs: &[[Vec4; shader::INPUT_REGISTERS]],
+    ) -> u32 {
+        let vertices = Vertices::Unshaded { vertex_shader, geometry_shader, inputs, order: None };
+        rasterize(registers, memory, resources, vertices).unwrap_or(0)
     }
 
     fn target_registers() -> Vec<u32> {
@@ -4584,18 +4888,24 @@ mod tests {
             })
             .collect();
         // the rows past the buffer, whatever memory holds there
-        let past: Vec<u8> = (0..SIZE * SIZE / 2 * 4).map(|_| (random() * 256.0) as u8).collect();
-        let quad: Vec<Vertex> = [[-1.0, -1.0, 0.0, 0.0], [3.0, -1.0, 2.0, 0.0], [-1.0, 3.0, 0.0, 2.0]]
-            .into_iter()
-            .map(|[x, y, u, v]| Vertex {
-                clip: [x, y, -0.5, 1.0],
-                color: [1.0; 4],
-                texcoords: [[u, v], [0.0; 2], [0.0; 2]],
-                quaternion: [0.0, 0.0, 0.0, 1.0],
-                view: [0.0; 3],
-                texcoord0_w: 1.0,
-            })
+        let past: Vec<u8> = (0..SIZE * SIZE / 2 * 4)
+            .map(|_| (random() * 256.0) as u8)
             .collect();
+        let quad: Vec<Vertex> = [
+            [-1.0, -1.0, 0.0, 0.0],
+            [3.0, -1.0, 2.0, 0.0],
+            [-1.0, 3.0, 0.0, 2.0],
+        ]
+        .into_iter()
+        .map(|[x, y, u, v]| Vertex {
+            clip: [x, y, -0.5, 1.0],
+            color: [1.0; 4],
+            texcoords: [[u, v], [0.0; 2], [0.0; 2]],
+            quaternion: [0.0, 0.0, 0.0, 1.0],
+            view: [0.0; 3],
+            texcoord0_w: 1.0,
+        })
+        .collect();
 
         let mut results = Vec::new();
         for (hardware, back_first) in [(first, false), (second, true)] {

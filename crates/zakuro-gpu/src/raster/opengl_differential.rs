@@ -101,10 +101,10 @@ fn opengl_resources() -> Option<Resources> {
             opengl: Some(renderer),
             ..Default::default()
         }),
-        Err(error) => {
-            println!("skipping the OpenGL differential tests: {error}");
-            None
-        }
+        // the context exists, so this is a real rasterizer failure, not a
+        // machine that cannot run these tests: the tests fail on it instead of
+        // passing untested
+        Err(error) => panic!("the OpenGL rasterizer could not start: {error}"),
     }
 }
 
@@ -1650,7 +1650,8 @@ fn opengl_blended_alphas_come_out_the_same() {
         let mut worst = 0u8;
         let mut worst_at = 0usize;
         for index in 0..(BUFFER * BUFFER) as usize {
-            let off = cpu_pixels[index][3].abs_diff(gl_pixels[index][3]);
+            // image() keeps the guest's ABGR order, so the alpha is byte 0
+            let off = cpu_pixels[index][0].abs_diff(gl_pixels[index][0]);
             if off > worst {
                 worst = off;
                 worst_at = index;
@@ -1662,8 +1663,8 @@ fn opengl_blended_alphas_come_out_the_same() {
             worst,
             worst_at as u32 % BUFFER,
             worst_at as u32 / BUFFER,
-            cpu_pixels[worst_at][3],
-            gl_pixels[worst_at][3],
+            cpu_pixels[worst_at][0],
+            gl_pixels[worst_at][0],
         );
     }
 }
@@ -2045,15 +2046,38 @@ fn opengl_textured_draws_match_the_cpu() {
     let first = cover(viewport, -0.5, FLAT);
     rasterize_shaded(&registers, &mut cpu, &mut Resources::default(), &first);
     rasterize_shaded(&registers, &mut gl, &mut resources, &first);
-    // then the texture registers arrive and the draw samples what it sits on
+    // then the texture registers arrive and the draw samples what it sits on:
+    // stage 0 hands texture 0 straight thru, so the second draw's color is the
+    // first draw's, not the second draw's own OTHER vertex color, and the
+    // test fails when the resident target's bytes never reach the decode
     registers[REG_TEXTURE_CONFIG] = 1;
     registers[TEXTURE_UNIT_BASES[0] + 1] = 8 | (8 << 16);
     registers[TEXTURE_UNIT_BASES[0] + 4] = COLOR >> 3;
     registers[TEXTURE_UNIT_BASES[0] + 13] = 0; // RGBA8
+    tev_stage(
+        &mut registers,
+        0,
+        [3, 0, 0],
+        [3, 0, 0],
+        [0; 3],
+        [0; 3],
+        0,
+        0,
+        0,
+    );
+    tev_passthrough(&mut registers, &[0]);
     textured_draw(&mut registers, &mut cpu, &mut Resources::default());
     textured_draw(&mut registers, &mut gl, &mut resources);
     resolve(&mut resources, &mut gl, 0);
     assert_images_identical(&cpu, &gl, "a draw sampling its own target");
+    // FLAT quantizes to [red, green, blue, alpha] 127, 63, 191, 127; image()
+    // returns the guest's ABGR order, so the known covered pixel reads
+    // [alpha, blue, green, red]
+    assert_eq!(
+        image(&gl)[8 * BUFFER as usize + 8],
+        [127, 191, 63, 127],
+        "the textured draw did not sample the target's FLAT color",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2205,33 +2229,25 @@ fn tev_passthrough(registers: &mut [u32], except: &[usize]) {
 /// a quad exactly over the target whose texture coordinates on the named sets
 /// run from (u0, v0) at the bottom left to (u1, v1) at the top right. The
 /// corners sit on the viewport's own edges, so every pixel center's coordinates
-/// land inside a texel, never on the boundary a rounding step would cross
+/// land inside a texel, never on the boundary a rounding step would cross.
+/// Each set interpolates between its own span's ends, so one asking for
+/// coordinates out of range keeps them there
 fn uv_quad(viewport: (f32, f32, f32, f32), spans: &[(&usize, f32, f32, f32, f32)]) -> Vec<Vertex> {
     let (vx, vy, vw, vh) = viewport;
-    let (u0, v0, u1, v1) = spans
-        .first()
-        .map_or((0.0, 0.0, 1.0, 1.0), |&(_, u0, v0, u1, v1)| {
-            (u0, v0, u1, v1)
-        });
     let mut vertices = Vec::with_capacity(6);
     for triangle in [
-        [
-            (vx, vy, u0, v0),
-            (vx + vw, vy, u1, v0),
-            (vx + vw, vy + vh, u1, v1),
-        ],
-        [
-            (vx, vy, u0, v0),
-            (vx + vw, vy + vh, u1, v1),
-            (vx, vy + vh, u0, v1),
-        ],
+        [(vx, vy), (vx + vw, vy), (vx + vw, vy + vh)],
+        [(vx, vy), (vx + vw, vy + vh), (vx, vy + vh)],
     ] {
-        vertices.extend(triangle.map(|(x, y, u, v)| {
+        vertices.extend(triangle.map(|(x, y)| {
             let mut vertex = corner_at(viewport, x, y, -0.5, 1.0, FLAT);
+            // where the corner sits across the quad, zero at the first corner
+            let (u, v) = ((x - vx) / vw, (y - vy) / vh);
             for (set, span_u0, span_v0, span_u1, span_v1) in spans.iter() {
-                let t = (u - span_u0) / (span_u1 - span_u0);
-                let s = (v - span_v0) / (span_v1 - span_v0);
-                vertex.texcoords[**set] = [t, s];
+                vertex.texcoords[**set] = [
+                    span_u0 + (span_u1 - span_u0) * u,
+                    span_v0 + (span_v1 - span_v0) * v,
+                ];
             }
             vertex
         }));
@@ -2378,20 +2394,28 @@ fn opengl_wrap_modes_and_border_colors_match_the_cpu() {
 #[test]
 fn opengl_linear_filtering_matches_the_cpu() {
     let viewport = (0.0, 0.0, 16.0, 16.0);
-    let texels: Vec<u8> = (0..64 * 4).map(pattern_byte).collect();
-    for (config, span, what) in [
-        (2u32, (0.0f32, 0.0, 1.0, 1.0), "magnifying"), // bit 1, linear when magnifying
-        (4, (0.0, 0.0, 1.0, 1.0), "minifying"),        // bit 2, linear when minifying
+    // (config, span, levels, size, what): the minifying case needs a mip chain
+    // and a coordinate rate above one texel a pixel to select minification; the
+    // span is then no whole texel a pixel at the level it picks, so bilinear and
+    // nearest sampling cannot land on the same texel centers
+    for (config, span, levels, size, what) in [
+        (2u32, (0.0f32, 0.0, 1.0, 1.0), 1u32, 8u32, "magnifying"), // bit 1, linear when magnifying
+        (4, (0.0, 0.0, 2.2, 2.2), 2, 16, "minifying"),             // bit 2, linear when minifying
     ] {
         let Some(mut resources) = opengl_resources() else {
             return;
         };
+        let texel_count: usize = (0..levels)
+            .map(|level| ((size >> level) * (size >> level)) as usize)
+            .sum();
+        let texels: Vec<u8> = (0..texel_count * 4).map(pattern_byte).collect();
+        let lod = (levels - 1) << 16;
         let mut registers = registers(0);
         let mut cpu = CountingMemory::zeroed(0x1_0000);
         let mut gl = CountingMemory::zeroed(0x1_0000);
-        lay_texture(&mut cpu, TEXTURE, &texels, 0, 8, 8, 1);
-        lay_texture(&mut gl, TEXTURE, &texels, 0, 8, 8, 1);
-        bind_texture_unit(&mut registers, 0, TEXTURE, 8, 8, 0, config, 0);
+        lay_texture(&mut cpu, TEXTURE, &texels, 0, size, size, levels);
+        lay_texture(&mut gl, TEXTURE, &texels, 0, size, size, levels);
+        bind_texture_unit(&mut registers, 0, TEXTURE, size, size, 0, config, lod);
         tev_stage(
             &mut registers,
             0,
@@ -2410,6 +2434,27 @@ fn opengl_linear_filtering_matches_the_cpu() {
         rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
         resolve(&mut resources, &mut gl, 0);
         assert_images_close(&cpu, &gl, &placed, 1, &format!("bilinear {what}"));
+        if what == "minifying" {
+            // the same draw with nearest minification, so the filter's work is
+            // visible and not just two backends agreeing on the wrong one
+            let mut nearest_registers = registers.clone();
+            nearest_registers[TEXTURE_UNIT_BASES[0] + 2] = 0;
+            let mut nearest = CountingMemory::zeroed(0x1_0000);
+            lay_texture(&mut nearest, TEXTURE, &texels, 0, size, size, levels);
+            rasterize_shaded(
+                &nearest_registers,
+                &mut nearest,
+                &mut Resources::default(),
+                &quad,
+            );
+            assert!(
+                image(&cpu)
+                    .iter()
+                    .zip(image(&nearest).iter())
+                    .any(|(linear, nearest)| linear != nearest),
+                "minifying with linear filtering matched nearest sampling",
+            );
+        }
     }
 }
 
@@ -2435,14 +2480,17 @@ fn opengl_mipmap_levels_match_the_cpu() {
     let green = [255u8, 0, 255, 0];
     let blue = [255u8, 255, 0, 0];
     let mixed = [255u8, 127, 127, 0];
-    // (uv span, config, lod word, the color the picked level answers)
-    let cases: [((f32, f32, f32, f32), u32, u32, [u8; 4], &str); 6] = [
-        ((0.0, 0.0, 0.5, 0.5), 0, 2 << 16, red, "level 0, magnified"),
+    // (uv span, config, lod word, the color the picked level answers in the
+    // decoder's own RGBA bytes, how far a channel may sit from it: flat levels
+    // answer exactly, the blended one a rounding step)
+    let cases: [((f32, f32, f32, f32), u32, u32, [u8; 4], u8, &str); 6] = [
+        ((0.0, 0.0, 0.5, 0.5), 0, 2 << 16, red, 0, "level 0, magnified"),
         (
             (0.0, 0.0, 1.0, 1.0),
             0,
             2 << 16,
             green,
+            0,
             "level 1, one texel a pixel",
         ),
         (
@@ -2450,20 +2498,25 @@ fn opengl_mipmap_levels_match_the_cpu() {
             0,
             2 << 16,
             blue,
+            0,
             "level 2, four texels a pixel",
         ),
         (
             (0.0, 0.0, 1.41421354, 1.41421354),
             0,
-            2 << 16,
+            // just under the halfway point, so float noise in the derivatives
+            // cannot tip the rounding over the tie
+            (2 << 16) | 0x1FFF,
             green,
-            "halfway takes the bigger level",
+            0,
+            "near halfway takes the bigger level",
         ),
         (
             (0.0, 0.0, 1.0, 1.0),
             0,
             (2 << 16) | 0xFF00,
             red,
+            0,
             "a bias of minus one",
         ),
         (
@@ -2471,10 +2524,11 @@ fn opengl_mipmap_levels_match_the_cpu() {
             1 << 24,
             2 << 16,
             mixed,
+            1,
             "the two levels about the level blend",
         ),
     ];
-    for (span, config, lod, expected, name) in cases {
+    for (span, config, lod, expected, tolerance, name) in cases {
         let Some(mut resources) = opengl_resources() else {
             return;
         };
@@ -2501,11 +2555,15 @@ fn opengl_mipmap_levels_match_the_cpu() {
         rasterize_shaded(&registers, &mut gl, &mut resources, &quad);
         resolve(&mut resources, &mut gl, 0);
         assert_images_identical(&cpu, &gl, name);
+        // the raw guest bytes run ABGR, the colors the fixtures lay down with
+        // them, so every channel of every pixel answers the level's own color
         for (index, pixel) in image(&cpu).iter().enumerate() {
-            assert_eq!(
-                pixel[0], expected[0],
-                "{name}: pixel {index} is not the level the rate picks"
-            );
+            for (channel, (&got, &want)) in pixel.iter().zip(&expected).enumerate() {
+                assert!(
+                    got.abs_diff(want) <= tolerance,
+                    "{name}: pixel {index} channel {channel} is {got}, not the level the rate picks ({want})",
+                );
+            }
         }
     }
 }
@@ -2595,12 +2653,15 @@ fn opengl_tev_buffer_and_scales_match_the_cpu() {
         );
         registers[TEV_UPDATE_BUFFER] = update;
         registers[TEV_BUFFER_COLOR] = 0x4080_C020;
-        // stage 2 folds the buffer over the constant, signed, at a scale
+        // stage 2 folds the buffer stage 0 wrote over the constant, signed, at a
+        // scale: reading it on both the color and the alpha sides, so the test
+        // fails when a backend ignores the buffer's updates, and the color-only
+        // case leaves the alpha at the configured buffer color's own alpha
         tev_stage(
             &mut registers,
             2,
-            [0xF, 0xE, 0xF],
-            [0xF, 0xE, 0xF],
+            [0xD, 0xE, 0xF],
+            [0xD, 0xE, 0xF],
             [0; 3],
             [0; 3],
             3 | (3 << 16),
@@ -2816,7 +2877,9 @@ fn opengl_texture_cache_reuse_invalidation_and_eviction() {
             "the rewritten texture answered with different bytes"
         );
     }
-    // (c) a budget of a couple of textures turns them over, the pixels stay right
+    // (c) a budget of one texture turns them over, the pixels stay right: the
+    // second texture evicts the first, and revisiting the first uploads it
+    // again instead of riding a stale copy
     {
         let Some(mut resources) = opengl_resources() else {
             return;
@@ -2825,7 +2888,7 @@ fn opengl_texture_cache_reuse_invalidation_and_eviction() {
             .opengl
             .as_mut()
             .unwrap()
-            .limit_texture_cache(2 * 8 * 8 * 4);
+            .limit_texture_cache(8 * 8 * 4);
         let mut registers = registers(0);
         let mut gl = CountingMemory::zeroed(0x1_0000);
         lay_texture(&mut gl, TEXTURE, &first, 0, 8, 8, 1);
@@ -2843,11 +2906,14 @@ fn opengl_texture_cache_reuse_invalidation_and_eviction() {
         );
         tev_passthrough(&mut registers, &[0]);
         let mut cpu = CountingMemory::zeroed(0x1_0000);
-        for (addr, texels) in [
+        for (visit, (addr, texels)) in [
             (TEXTURE, &first),
             (OTHER_TEXTURE, &second),
             (TEXTURE, &first),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut registers = registers.clone();
             lay_texture(&mut gl, addr, texels, 0, 8, 8, 1);
             lay_texture(&mut cpu, addr, texels, 0, 8, 8, 1);
@@ -2859,6 +2925,11 @@ fn opengl_texture_cache_reuse_invalidation_and_eviction() {
             registers[TEXTURE_UNIT_BASES[0] + 13] = 0;
             draw(&registers, &mut cpu, &mut Resources::default());
             draw(&registers, &mut gl, &mut resources);
+            assert_eq!(
+                resources.opengl.as_ref().unwrap().texture_count(),
+                1,
+                "visit {visit} did not turn the one-texture cache over",
+            );
             resolve(&mut resources, &mut gl, 0);
             assert_images_identical(
                 &cpu,
@@ -3707,7 +3778,10 @@ fn opengl_rgb8_targets_match_the_cpu() {
         plain[REG_BLEND_COLOR] = BLEND_CONSTANT;
         let mut blended = plain.clone();
         blended[REG_COLOR_OPERATION] = 0x100;
-        blended[REG_BLEND_FUNC] = blend_func((0, 6, 7), (0, 1, 0));
+        // the destination factor reads the copy's own alpha, which stays at the
+        // 255 the format decodes like the software path reads back, so a draw
+        // whose copy kept anything else there would blend differently
+        blended[REG_BLEND_FUNC] = blend_func((0, 6, 8), (0, 1, 0));
         let mut cpu = CountingMemory::zeroed(0x1_0000);
         let mut gl = CountingMemory::zeroed(0x1_0000);
         let base = cover(viewport, -0.5, FLAT);
@@ -3726,19 +3800,27 @@ fn opengl_rgb8_targets_match_the_cpu() {
         let Some(mut resources) = opengl_resources() else {
             return;
         };
-        let mut masked = registers(0);
-        masked[REG_COLOR_BUFFER_FORMAT] = 1 << 16;
-        masked[REG_DEPTH_COLOR_MASK] = 0x7 << 8; // red and green only
+        let mut plain = registers(0);
+        plain[REG_COLOR_BUFFER_FORMAT] = 1 << 16;
+        let mut masked = plain.clone();
+        masked[REG_DEPTH_COLOR_MASK] = 0x3 << 8; // red and green only
         let mut cpu = CountingMemory::zeroed(0x1_0000);
         let mut gl = CountingMemory::zeroed(0x1_0000);
         let base = cover(viewport, -0.5, FLAT);
-        rasterize_shaded(&registers(0), &mut cpu, &mut Resources::default(), &base);
-        rasterize_shaded(&registers(0), &mut gl, &mut resources, &base);
+        rasterize_shaded(&plain, &mut cpu, &mut Resources::default(), &base);
+        rasterize_shaded(&plain, &mut gl, &mut resources, &base);
         let quad = cover(viewport, -0.4, OTHER);
         rasterize_shaded(&masked, &mut cpu, &mut Resources::default(), &quad);
         rasterize_shaded(&masked, &mut gl, &mut resources, &quad);
         resolve(&mut resources, &mut gl, 0);
         assert_rgb8_identical(&cpu, &gl, "an RGB8 partial color mask");
+        // RGB8 stores blue, green, red; the base's FLAT blue is 191 and the
+        // masked draw may only change red and green
+        assert_eq!(
+            rgb8_image(&gl)[8 * BUFFER as usize + 8][0],
+            191,
+            "the masked RGB8 draw changed blue",
+        );
     }
     // what the GL holds resolves into the guest's tiled RGB8 bytes, so a later
     // draw reading the target as a texture sees the same texels both ways
@@ -4132,10 +4214,29 @@ fn load_lighting_tables(
     tables: &mut crate::lighting::Tables,
     entries: &[(usize, u32)],
 ) {
+    let mut loaded = None;
     for &(number, value) in entries {
-        registers[LIGHT_TABLE_INDEX] = (number << 8) as u32;
+        // the table number selects the row; its low byte is the entry, which
+        // Tables::write moves on to the next one, so the index is only set when
+        // the loader switches rows and each ramp fills its own entries
+        if loaded != Some(number) {
+            registers[LIGHT_TABLE_INDEX] = (number << 8) as u32;
+            loaded = Some(number);
+        }
         tables.write(registers, value);
     }
+}
+
+/// the lighting-table loader must let the entry index advance through a whole
+/// ramp, not rewrite entry zero for every value
+#[test]
+fn lighting_table_loader_fills_every_entry() {
+    let mut registers = vec![0u32; LIGHT_TABLE_INDEX + 1];
+    let mut tables = crate::lighting::Tables::default();
+    load_lighting_tables(&mut registers, &mut tables, &rising_table(3));
+    let entries = tables.entries();
+    assert!(entries[3][0][0] < entries[3][128][0], "entry 128 stayed zero");
+    assert!(entries[3][128][0] < entries[3][255][0], "entry 255 stayed zero");
 }
 
 /// lights the first light for a case that reads none of its tables: the
@@ -4196,7 +4297,8 @@ fn lit_corners(
 /// texture bytes feed the CPU rasterizer and the GL's uber-shader, and the lit
 /// bytes come out a rounding step apart at most, the sums and dots the two
 /// sides evaluate in different orders wobbling the last step like the
-/// combiners already do
+/// combiners already do. Returns the GL's pixels, for cases that compare two
+/// runs of the GL against each other
 fn run_lit(
     resources: &mut Resources,
     registers: &mut [u32],
@@ -4204,7 +4306,7 @@ fn run_lit(
     texels: Option<&[u8]>,
     quad: &[Vertex],
     name: &str,
-) {
+) -> Vec<[u8; 4]> {
     let mut cpu_resources = Resources {
         light_tables: cpu_tables,
         ..Default::default()
@@ -4218,8 +4320,27 @@ fn run_lit(
     let placed = placed_triangles(registers, quad);
     rasterize_shaded(registers, &mut cpu, &mut cpu_resources, quad);
     rasterize_shaded(registers, &mut gl, resources, quad);
+    // the draw reached the GL at all: a silent fallback to the CPU would make
+    // the comparison, and anything built on it, prove nothing
+    assert!(
+        resources
+            .opengl
+            .as_ref()
+            .and_then(|renderer| renderer.surface_dirty(COLOR))
+            == Some(true),
+        "{name}: lighting draw did not submit to OpenGL",
+    );
     resolve(resources, &mut gl, 0);
+    assert!(
+        resources
+            .opengl
+            .as_ref()
+            .and_then(|renderer| renderer.surface_dirty(COLOR))
+            == Some(false),
+        "{name}: resolve did not write the resident color target back",
+    );
     assert_images_close(&cpu, &gl, &placed, 1, name);
+    image(&gl)
 }
 
 /// a combiner handing one lighting color straight thru, the stages passing
@@ -4378,12 +4499,13 @@ fn opengl_fragment_lighting_matches_the_cpu() {
             "a distance attenuation",
         );
     }
-    // the fresnel factor into the primary alpha
+    // the fresnel factor into the primary alpha, under a configuration the
+    // lighting supports (configuration 0 has no fresnel table at all)
     {
         let mut registers = registers(0);
         plain_light(&mut registers);
         registers[LIGHT_CONFIG1] &= !(1 << 19); // the fresnel back on
-        registers[LIGHT_CONFIG0] = 1 << 2; // into the primary alpha
+        registers[LIGHT_CONFIG0] = (1 << 4) | (1 << 2); // configuration 1, into the primary alpha
         registers[LIGHT_TABLE_INPUT] = 2 << 12; // the normal against the view
         thru_stage(&mut registers, 1);
         let quad = lit_corners(quaternions, views, ws, -0.5, no_texcoords);
@@ -4394,13 +4516,34 @@ fn opengl_fragment_lighting_matches_the_cpu() {
             &mut resources.light_tables,
             &rising_table(3),
         );
-        run_lit(
+        let with_fresnel = run_lit(
             &mut resources,
             &mut registers,
             tables,
             None,
             &quad,
             "a fresnel factor in the alpha",
+        );
+
+        // the same draw with the fresnel table disabled must leave a different
+        // alpha, or the case above proved nothing
+        registers[LIGHT_CONFIG1] |= 1 << 19;
+        let mut tables = crate::lighting::Tables::default();
+        load_lighting_tables(&mut registers, &mut tables, &rising_table(3));
+        let without_fresnel = run_lit(
+            &mut resources,
+            &mut registers,
+            tables,
+            None,
+            &quad,
+            "the fresnel factor switched off",
+        );
+        assert!(
+            with_fresnel
+                .iter()
+                .zip(&without_fresnel)
+                .any(|(on, off)| on[0] != off[0]),
+            "fresnel enabled and disabled left the same alpha",
         );
     }
     // a global ambient the diffuse sums into, an ambient color on the light

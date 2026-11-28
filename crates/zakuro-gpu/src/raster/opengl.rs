@@ -301,14 +301,18 @@ bool alpha_passes(int value, int reference) {
 }
 /// one texel's coordinate wrapped back inside the texture, the way the software
 /// rasterizer wraps texel indices
+/// GLSL leaves `%` undefined when an operand is negative, and repeat coordinates
+/// outside the texture and bilinear taps on its edge go in negative, so the
+/// remainder comes from a shifted value that never is
+int positive_remainder(int coordinate, int period) {
+    return coordinate >= 0 ? coordinate % period : period - 1 - (-(coordinate + 1) % period);
+}
 int wrap_coordinate(int mode, int coordinate, int size) {
     if (mode == 2) {
-        int wrapped = coordinate % size;
-        return wrapped < 0 ? wrapped + size : wrapped;
+        return positive_remainder(coordinate, size);
     }
     if (mode == 3) {
-        int period = coordinate % (2 * size);
-        if (period < 0) period += 2 * size;
+        int period = positive_remainder(coordinate, 2 * size);
         return period < size ? period : 2 * size - 1 - period;
     }
     return clamp(coordinate, 0, size - 1);
@@ -348,10 +352,22 @@ vec4 sample_size(sampler2D image, int unit, vec2 coord, int level, bool linear) 
 /// one unit's sample: the level of detail from the rate the coords change
 /// across the screen, plus the unit's bias and bounds, like `sample_at`
 vec4 sample_unit(sampler2D image, int unit, vec2 coord) {
-    vec2 per_step_x = dFdx(coord) * tex_size[unit];
-    vec2 per_step_y = dFdy(coord) * tex_size[unit];
+    // a coord is a numerator over 1/w (or over set 0's w over w when unit 0 is
+    // projected), both going linearly across the screen, so it changes by the
+    // numerator's change minus the coord times the denominator's, over the
+    // denominator, like the software rasterizer differences them
+    float denominator = unit == 0 && tex0_projected == 1 ? q0 * pica_inverse_w : pica_inverse_w;
+    float den = abs(denominator) < 1e-8 ? 1.0 : denominator;
+    vec2 numerator = coord * den;
+    vec2 per_step_x = (dFdx(numerator) - coord * dFdx(den)) / den * tex_size[unit];
+    vec2 per_step_y = (dFdy(numerator) - coord * dFdy(den)) / den * tex_size[unit];
     vec4 lod = tex_lod[unit];
-    float level = 0.5 * log2(max(dot(per_step_x, per_step_x), dot(per_step_y, per_step_y)));
+    float rate = max(dot(per_step_x, per_step_x), dot(per_step_y, per_step_y));
+    // log2(0) is undefined: a coordinate flat across the screen lands at the
+    // rate's limit, which the bounds clamp to the smallest level like the
+    // software's own -inf does, the base level and magnification filter for a
+    // texture of one size
+    float level = rate > 0.0 ? 0.5 * log2(rate) : -1.0e30;
     level = clamp(level + lod.x, lod.y, lod.z);
     if (!(level > 0.0)) {
         // magnified, so the magnification filter applies
@@ -874,6 +890,10 @@ pub(crate) struct OpenGlRasterizer {
     /// the lighting and fog tables, one shared texture rows wide: 24 lighting
     /// tables of 256 entries, then the fog's 128 on the last row
     lookup_tables: glow::Texture,
+    /// the texture bound on a sampler unit the draw has no guest texture for,
+    /// so a sampler the shader still declares can never stay bound to the
+    /// framebuffer's own color attachment and read what the draw writes
+    dummy_texture: glow::Texture,
     /// the lighting tables these rows hold, so an entry rewritten between draws
     /// is the one row that uploads again
     lut_tables_id: u64,
@@ -903,6 +923,7 @@ impl Drop for OpenGlRasterizer {
         }
         unsafe {
             self.gl.delete_texture(self.lookup_tables);
+            self.gl.delete_texture(self.dummy_texture);
             self.gl.delete_vertex_array(self.vertex_array);
             self.gl.delete_buffer(self.vertices);
             self.gl.delete_program(self.program);
@@ -1047,6 +1068,42 @@ impl OpenGlRasterizer {
             );
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.active_texture(glow::TEXTURE0);
+            let dummy_texture = match gl.create_texture() {
+                Ok(texture) => texture,
+                Err(error) => {
+                    gl.delete_buffer(vertices);
+                    gl.delete_vertex_array(vertex_array);
+                    gl.delete_texture(lookup_tables);
+                    gl.delete_program(program);
+                    return Err(error.to_string());
+                }
+            };
+            gl.bind_texture(glow::TEXTURE_2D, Some(dummy_texture));
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            // one opaque texel no draw reads, the sampler's placeholder
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                1,
+                1,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&[0u8, 0, 0, 255])),
+            );
+            gl.bind_texture(glow::TEXTURE_2D, None);
             let uniforms = Uniforms {
                 depth_scale: gl.get_uniform_location(program, "depth_scale"),
                 depth_offset: gl.get_uniform_location(program, "depth_offset"),
@@ -1131,6 +1188,7 @@ impl OpenGlRasterizer {
                         gl.delete_buffer(vertices);
                         gl.delete_vertex_array(vertex_array);
                         gl.delete_texture(lookup_tables);
+                        gl.delete_texture(dummy_texture);
                         gl.delete_program(program);
                         return Err(error);
                     }
@@ -1156,6 +1214,7 @@ impl OpenGlRasterizer {
                 texture_budget: TEXTURE_CACHE_BUDGET,
                 last_tev: None,
                 lookup_tables,
+                dummy_texture,
                 lut_tables_id: u64::MAX,
                 lut_tables_changed: [u64::MAX; crate::lighting::TABLES],
                 lut_fog_generation: u64::MAX,
@@ -1520,11 +1579,15 @@ impl OpenGlRasterizer {
                     }
                 }
                 for (unit, texture) in bound.iter().enumerate() {
-                    let Some(texture) = texture else { continue };
-                    let Some(setup) = textures.units[unit].as_ref() else {
+                    gl.active_texture(glow::TEXTURE0 + unit as u32);
+                    let (Some(texture), Some(setup)) =
+                        (texture, textures.units[unit].as_ref())
+                    else {
+                        // a sampler the shader still declares must never stay
+                        // bound to the framebuffer's own color attachment
+                        gl.bind_texture(glow::TEXTURE_2D, Some(self.dummy_texture));
                         continue;
                     };
-                    gl.active_texture(glow::TEXTURE0 + unit as u32);
                     gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
                     gl.tex_parameter_i32(
                         glow::TEXTURE_2D,
@@ -1543,7 +1606,14 @@ impl OpenGlRasterizer {
                     gl.tex_parameter_i32(
                         glow::TEXTURE_2D,
                         glow::TEXTURE_MIN_FILTER,
-                        if setup.min_linear {
+                        // the shader picks levels out of the chain itself, so a
+                        // texture of several sizes keeps a mipmapped filter even
+                        // when the guest's minification filter is a plain one;
+                        // its point, bilinear and mip-blending decisions ride
+                        // the shader's uniforms
+                        if setup.levels > 1 {
+                            glow::NEAREST_MIPMAP_NEAREST
+                        } else if setup.min_linear {
                             glow::LINEAR
                         } else {
                             glow::NEAREST
@@ -1706,8 +1776,12 @@ impl OpenGlRasterizer {
                 gl.uniform_4_f32_slice(Some(location), &ambient);
             }
             if let Some(location) = &uniforms.light_data {
+                // each light's slot carries 32 words of float data, then four of
+                // integer metadata the flags ride separately, and the shader
+                // strides light_data by eight vec4s of the data alone
                 let data: Vec<f32> = words[40..]
-                    .iter()
+                    .chunks_exact(36)
+                    .flat_map(|light| light[..32].iter())
                     .map(|word| f32::from_bits(*word))
                     .collect();
                 gl.uniform_4_f32_slice(Some(location), &data);
@@ -1810,10 +1884,16 @@ impl OpenGlRasterizer {
                 glow::TEXTURE_MAX_LEVEL,
                 (levels - 1) as i32,
             );
+            // a chain of sizes keeps a mipmapped filter so sampling past the
+            // base level stays defined, like the draw-time setup keeps
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
                 glow::TEXTURE_MIN_FILTER,
-                glow::NEAREST as i32,
+                if levels > 1 {
+                    glow::NEAREST_MIPMAP_NEAREST
+                } else {
+                    glow::NEAREST
+                } as i32,
             );
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D,
@@ -2013,6 +2093,21 @@ impl OpenGlRasterizer {
     #[cfg(test)]
     pub(crate) fn limit_texture_cache(&mut self, bytes: u64) {
         self.texture_budget = bytes;
+    }
+
+    /// how many uploaded textures the cache holds, for the eviction tests
+    #[cfg(test)]
+    pub(crate) fn texture_count(&self) -> usize {
+        self.textures.len()
+    }
+
+    /// whether a target remains resident and dirty, for differential tests
+    #[cfg(test)]
+    pub(crate) fn surface_dirty(&self, addr: u32) -> Option<bool> {
+        self.surfaces
+            .iter()
+            .find(|(key, _)| key.addr == addr)
+            .map(|(_, surface)| surface.dirty)
     }
 
     fn evict_to_budget<M: GpuMemory>(&mut self, memory: &mut M, incoming_bytes: u64) {

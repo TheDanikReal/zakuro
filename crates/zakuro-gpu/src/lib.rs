@@ -730,24 +730,15 @@ impl Gpu {
     }
 
     /// draws the texture pack's pictures in place of the textures they replace, or no pack's
-    /// only the host's GPU draws them, so a pack waits for enable_hardware_renderer, and says if it's drawn
+    /// only the Vulkan renderer draws them so far, so a pack waits for enable_hardware_renderer, and says if it's drawn
     pub fn set_texture_pack(&mut self, pack: Option<std::sync::Arc<pack::Pack>>) -> bool {
-        #[cfg(any(feature = "vulkan", feature = "opengl"))]
-        let rasterizer_enabled = {
-            let mut enabled = false;
-            #[cfg(feature = "vulkan")]
-            {
-                enabled |= self.resources.hardware.is_some();
-            }
-            #[cfg(feature = "opengl")]
-            {
-                enabled |= self.resources.opengl.is_some();
-            }
-            enabled
-        };
-        #[cfg(any(feature = "vulkan", feature = "opengl"))]
-        let pack = pack.filter(|_| rasterizer_enabled);
-        #[cfg(not(any(feature = "vulkan", feature = "opengl")))]
+        // the replacements ride the Vulkan renderer alone: neither the OpenGL
+        // rasterizer nor the software fallback samples a pack's pictures yet, so
+        // taking a pack there would report it drawn while the guest texels stay
+        // on screen. Says whether the pack is actually drawn.
+        #[cfg(feature = "vulkan")]
+        let pack = pack.filter(|_| self.resources.hardware.is_some());
+        #[cfg(not(feature = "vulkan"))]
         let pack = pack.filter(|_| false);
         let drawn = pack.is_some();
         self.resources.textures.set_pack(pack);

@@ -834,6 +834,71 @@ fn shading_ahead() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ZAKURO_SHADE_AHEAD").map_or(true, |value| value != "0"))
 }
 
+/// the vertices a draw names, from the first to the last, once its indices are in scratch
+fn draw_vertex_range(registers: &[u32], scratch: &Scratch, indexed: bool) -> (u32, u32) {
+    let short = registers[REG_INDEX_ARRAY] & 0x8000_0000 != 0;
+    match (indexed, short) {
+        (false, _) => {
+            let first = registers[REG_VERTEX_OFFSET];
+            (first, first + registers[REG_VERTEX_COUNT] - 1)
+        }
+        (true, true) => {
+            let halves = scratch.bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as u32);
+            halves.fold((u32::MAX, 0), |(low, high), index| (low.min(index), high.max(index)))
+        }
+        (true, false) => scratch.bytes.iter().fold((u32::MAX, 0), |(low, high), &index| {
+            (low.min(index as u32), high.max(index as u32))
+        }),
+    }
+}
+
+/// the index buffer's own bytes, which the CPU happens to read from guest memory
+/// even while an OpenGL surface holds newer bytes over the same address
+#[cfg(feature = "opengl")]
+fn sync_index_input<M: GpuMemory>(
+    renderer: Option<&mut opengl::OpenGlRasterizer>,
+    memory: &mut M,
+    registers: &[u32],
+) {
+    let Some(renderer) = renderer else {
+        return;
+    };
+    let config = registers[REG_INDEX_ARRAY];
+    let size = if config & 0x8000_0000 != 0 { 2 } else { 1 };
+    let len = registers[REG_VERTEX_COUNT].saturating_mul(size);
+    if len != 0 {
+        let addr = memory.translate(
+            loc_register(registers, REG_ATTRIBUTE_BASE).saturating_add(config & 0x0FFF_FFFF),
+        );
+        renderer.sync(memory, addr, len, false);
+    }
+}
+
+/// each attribute array's bytes from the first vertex the draw names to the last,
+/// whose ranges a dirty OpenGL surface under them resolves into guest memory
+/// first, like the texture units' ranges do before a decode reads their bytes
+#[cfg(feature = "opengl")]
+fn sync_vertex_input<M: GpuMemory>(
+    renderer: Option<&mut opengl::OpenGlRasterizer>,
+    memory: &mut M,
+    registers: &[u32],
+    plan: &InputPlan,
+    (low, high): (u32, u32),
+) {
+    let Some(renderer) = renderer else {
+        return;
+    };
+    let base = loc_register(registers, REG_ATTRIBUTE_BASE);
+    for loader in &plan.loaders {
+        let first = base + loader.offset + low * loader.stride;
+        let last = base + loader.offset + high * loader.stride;
+        let len = last - first + loader.size;
+        if len != 0 {
+            renderer.sync(memory, memory.translate(first), len, false);
+        }
+    }
+}
+
 /// the walk ahead's half of a command list's draw
 /// what draw reads of memory first (the index buffer and the vertices it names) handed w/ the state shading takes
 /// to another thread, which shades, clips and places them for the real walk's draw
@@ -853,21 +918,17 @@ pub(crate) fn hand_out<M: GpuMemory>(
     }
     let writes = memory.writes();
     let scratch = resources.scratch.get_or_insert_with(Box::default);
+    // a dirty OpenGL surface under the draw's vertex bytes resolves into guest
+    // memory first, like the texture units' ranges do before a decode
+    #[cfg(feature = "opengl")]
+    sync_index_input(resources.opengl.as_mut(), memory, registers);
     read_indices(registers, memory, scratch, indexed);
-    let plan = scratch.plans.update(registers, fixed_attributes);
     // the vertices the draw names, from the first to the last
     let short = registers[REG_INDEX_ARRAY] & 0x8000_0000 != 0;
-    let range = match (indexed, short) {
-        (false, _) => {
-            let first = registers[REG_VERTEX_OFFSET];
-            (first, first + vertex_count - 1)
-        }
-        (true, true) => {
-            let halves = scratch.bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as u32);
-            halves.fold((u32::MAX, 0), |(low, high), index| (low.min(index), high.max(index)))
-        }
-        (true, false) => scratch.bytes.iter().fold((u32::MAX, 0), |(low, high), &index| (low.min(index as u32), high.max(index as u32))),
-    };
+    let range = draw_vertex_range(registers, scratch, indexed);
+    let plan = scratch.plans.update(registers, fixed_attributes);
+    #[cfg(feature = "opengl")]
+    sync_vertex_input(resources.opengl.as_mut(), memory, registers, plan, range);
     // the bytes the thread decodes the vertices from, or the vertices decoded here where the arrays don't sit together in memory
     let attribute_base = loc_register(registers, REG_ATTRIBUTE_BASE);
     let fetched = match plan.copy(memory, attribute_base, range, vertex_count) {
@@ -2813,7 +2874,13 @@ pub fn draw<M: GpuMemory>(
 
     // an index buffer names most vertices several times, fetch and shade each of them once
     let mut scratch = resources.scratch.take().unwrap_or_default();
+    // a dirty OpenGL surface under the draw's vertex bytes resolves into guest
+    // memory first, like the texture units' ranges do before a decode
+    #[cfg(feature = "opengl")]
+    sync_index_input(resources.opengl.as_mut(), memory, registers);
     read_indices(registers, memory, &mut scratch, indexed);
+    #[cfg(feature = "opengl")]
+    let vertex_range = draw_vertex_range(registers, &scratch, indexed);
     let plan = scratch.plans.update(registers, fixed_attributes);
     log::trace!(
         "array draw: {vertex_count} vertices from 0x{attribute_base:08X}, indexed {indexed}, formats \
@@ -2821,6 +2888,14 @@ pub fn draw<M: GpuMemory>(
         registers[REG_ATTRIBUTE_FORMAT_HIGH],
         registers[REG_ATTRIBUTE_FORMAT_LOW],
         plan.loaders.iter().map(|l| (l.offset, l.stride, l.size)).collect::<Vec<_>>(),
+    );
+    #[cfg(feature = "opengl")]
+    sync_vertex_input(
+        resources.opengl.as_mut(),
+        memory,
+        registers,
+        plan,
+        vertex_range,
     );
     // the GPU decodes the arrays itself when it shades the draw, from the first vertex the draw uses to the last
     #[cfg(feature = "vulkan")]
